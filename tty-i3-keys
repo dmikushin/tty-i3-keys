@@ -1,0 +1,124 @@
+#!/usr/bin/python3
+"""Win+Shift+S on the text console: toggle suspend-on-lid-close.
+
+i3 binds the same chord to ~/.config/i3/toggle-lid-suspend.sh, but on a text
+VT nothing listens for it. This daemon reads every keyboard's evdev node and,
+when the chord is pressed while the foreground VT is in text mode (KD_TEXT,
+i.e. not X), runs that same script as the user who owns the VT, so X and the
+console share one state (the script's systemd-inhibit process and pidfile).
+The resulting state is printed on that VT.
+"""
+import fcntl
+import glob
+import os
+import pwd
+import select
+import struct
+import subprocess
+
+EVENT = struct.Struct("llHHi")
+EV_KEY = 0x01
+KEY_LEFTSHIFT, KEY_RIGHTSHIFT = 42, 54
+KEY_LEFTMETA, KEY_RIGHTMETA = 125, 126
+KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT = 29, 97, 56, 100
+KEY_S = 31
+EVIOCGBIT_EV_KEY = 0x80604521  # EVIOCGBIT(EV_KEY, 96)
+KDGETMODE, KD_TEXT = 0x4B3B, 0x00
+SCRIPT = ".config/i3/toggle-lid-suspend.sh"
+RESCAN_SECONDS = 5
+
+
+def is_keyboard(path):
+    """True if the device reports both KEY_S and KEY_LEFTMETA."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    bits = bytearray(96)
+    try:
+        fcntl.ioctl(fd, EVIOCGBIT_EV_KEY, bits)
+    except OSError:
+        os.close(fd)
+        return None
+    has = lambda code: bits[code // 8] >> (code % 8) & 1
+    if has(KEY_S) and has(KEY_LEFTMETA):
+        return fd
+    os.close(fd)
+    return None
+
+
+def scan(open_fds):
+    known = set(open_fds.values())
+    for path in glob.glob("/dev/input/event*"):
+        if path not in known:
+            fd = is_keyboard(path)
+            if fd is not None:
+                open_fds[fd] = path
+
+
+def foreground_text_vt():
+    """Return /dev/ttyN of the foreground VT if it is in text mode, else None."""
+    with open("/sys/class/tty/tty0/active") as f:
+        tty = "/dev/" + f.read().strip()
+    fd = os.open(tty, os.O_RDONLY | os.O_NOCTTY)
+    try:
+        mode = bytearray(4)
+        fcntl.ioctl(fd, KDGETMODE, mode)
+    finally:
+        os.close(fd)
+    return tty if struct.unpack("i", mode)[0] == KD_TEXT else None
+
+
+def toggle(tty):
+    uid = os.stat(tty).st_uid
+    if uid == 0:
+        return  # login prompt: nobody to act for
+    user = pwd.getpwuid(uid)
+    script = os.path.join(user.pw_dir, SCRIPT)
+    run = lambda arg, out: subprocess.run(
+        ["runuser", "-u", user.pw_name, "--", script, arg],
+        env={"HOME": user.pw_dir, "PATH": "/usr/local/bin:/usr/bin"},
+        stdout=out, stderr=subprocess.DEVNULL, text=True)
+    # The inhibitor left running by "toggle" inherits stdout: never pipe it.
+    run("toggle", subprocess.DEVNULL)
+    status = run("status", subprocess.PIPE).stdout.strip()
+    with open(tty, "w") as f:
+        f.write(f"\r\n[{status}]\r\n")
+
+
+def main():
+    fds = {}
+    held = set()
+    scan(fds)
+    while True:
+        ready, _, _ = select.select(list(fds), [], [], RESCAN_SECONDS)
+        if not ready:
+            scan(fds)
+            continue
+        for fd in ready:
+            try:
+                data = os.read(fd, EVENT.size * 64)
+            except OSError:  # device unplugged
+                os.close(fd)
+                del fds[fd]
+                continue
+            for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, type_, code, value = EVENT.unpack_from(data, i)
+                if type_ != EV_KEY:
+                    continue
+                if value == 0:
+                    held.discard(code)
+                    continue
+                held.add(code)
+                if (value == 1 and code == KEY_S
+                        and held & {KEY_LEFTMETA, KEY_RIGHTMETA}
+                        and held & {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
+                        and not held & {KEY_LEFTCTRL, KEY_RIGHTCTRL,
+                                        KEY_LEFTALT, KEY_RIGHTALT}):
+                    tty = foreground_text_vt()
+                    if tty:
+                        toggle(tty)
+
+
+if __name__ == "__main__":
+    main()

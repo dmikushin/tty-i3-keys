@@ -1,0 +1,12 @@
+[Unit]
+Description=Win+Shift+S on text consoles toggles suspend-on-lid-close
+
+[Service]
+ExecStart=/usr/local/bin/tty-lid-toggle-hotkey
+Restart=always
+# The toggle script leaves a systemd-inhibit process running; it must
+# survive restarts of this daemon.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
