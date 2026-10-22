@@ -525,20 +525,42 @@ class I3Blocks:
         self.proc = None
 
 
-def text_cells(text, fg, bg, glyphs):
+# Characters the user's i3blocks scripts emit that a console font lacks:
+# Font Awesome icons (private use) and a few symbols. Per block name (None:
+# any block), each maps to alternatives tried in order against the font;
+# the first the font can draw wins. Other icons are dropped: the text next
+# to them (percentages, names, times) says what they say.
+SUBSTITUTES = {
+    "battery": {"\uf0e7": ("\u2191", "+")},      # charging bolt: up arrow
+    None: {"\u2716": ("\u2716", "x")},           # volume muted cross
+}
+
+
+def text_cells(text, fg, bg, glyphs, block=None):
+    """Screen cells for `text`: characters the font has; else a substitute
+    from SUBSTITUTES; else a compatibility form the font has (U+2103 ->
+    degree sign, C); else nothing - never a placeholder box."""
+    table = {**SUBSTITUTES[None], **SUBSTITUTES.get(block, {})}
     out = []
     for ch in text[:MAX_BLOCK_TEXT]:
-        if is_icon(ch):
+        if ch in table:
+            for alt in table[ch]:
+                if all(c in glyphs for c in alt):
+                    out += [(glyphs[c], fg, bg) for c in alt]
+                    break
             continue
-        if ch in glyphs:
+        if ch in glyphs and not is_icon(ch):
             out.append((glyphs[ch], fg, bg))
             continue
-        # A compatibility form the font has: U+2103 -> degree sign, C.
         alt = unicodedata.normalize("NFKD", ch)
         if alt != ch and all(c in glyphs for c in alt):
             out += [(glyphs[c], fg, bg) for c in alt]
-        else:
-            out.append((glyphs.get("?", ord("?")), fg, bg))
+    # A dropped icon leaves its spaces behind: no runs, no edges.
+    space = glyphs.get(" ", 32)
+    out = [c for n, c in enumerate(out)
+           if c[0] != space or (n and out[n - 1][0] != space)]
+    while out and out[-1][0] == space:
+        out.pop()
     return out
 
 
@@ -569,7 +591,7 @@ def render(blocks, message, cols, glyphs, colors, hi_font):
             elif block.get("background"):
                 bg = nearest(parse_color(block["background"], BAR_BG),
                              colors[:8])
-            row += text_cells(text, fg, bg, glyphs)
+            row += text_cells(text, fg, bg, glyphs, block.get("name"))
             if n < len(blocks) - 1:
                 width = block.get("separator_block_width", 9)
                 width = width if isinstance(width, int) else 9

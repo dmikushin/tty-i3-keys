@@ -24,9 +24,11 @@ How it works:
   their i3 bar. It runs persistently as the user (with no `DISPLAY`), and its
   i3bar JSON stream is drawn into the screen memory through `/dev/vcsaN`, over
   whatever program is on the VT, without moving the cursor or sending the
-  program anything. Text is mapped to the console font's glyphs. Icon-font
-  characters are dropped, and other missing characters get a compatibility
-  form (`℃` -> `°C`) or `?`. Colors map to the console palette. When the bar
+  program anything. Text is mapped to the console font's glyphs. A small table
+  substitutes the icons the user's scripts emit (the battery block's
+  charging bolt `U+F0E7` becomes `↑`, or `+` if the font lacks it). Missing
+  characters get a compatibility form (`℃` -> `°C`). Anything else the font
+  lacks, such as the other icons, is dropped together with its spacing. Colors map to the console palette. When the bar
   goes away, a cell is put back only if it still shows the bar and the
   program has not written there. The `/dev/vcsuN` text shadow, which only
   program output changes, catches writes of identical cells. If the screen

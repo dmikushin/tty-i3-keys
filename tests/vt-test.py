@@ -210,7 +210,34 @@ def inhibited():
         capture_output=True, text=True).stdout
 
 
+def render_test():
+    """Icons of the user's i3blocks scripts, as the console draws them: the
+    charging bolt U+F0E7 of the battery block becomes the charging marker,
+    other icons disappear with their spaces."""
+    daemon = daemon_module()
+    fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+    glyphs, hi_font = daemon.font_map(fd)
+    colors = daemon.palette(fd)
+    os.close(fd)
+    chars = {}
+    for ch, glyph in glyphs.items():
+        if ch.isprintable():
+            chars.setdefault(glyph, ch)
+    blocks = [{"name": "battery", "full_text": "\uf241 54% \uf0e7",
+               "separator": False},
+              {"name": "weather", "full_text": "Geneva \uf0e7 14\u2103",
+               "separator": False}]
+    row = daemon.render(blocks, None, 60, glyphs, colors, hi_font)
+    words = struct.unpack(f"={len(row) // 2}H", row)
+    text = "".join(chars.get(w & (0x1FF if hi_font else 0xFF), "?")
+                   for w in words).strip()
+    marker = "\u2191" if "\u2191" in glyphs else "+"
+    return check("charging bolt U+F0E7 renders as the charging marker",
+                 text.encode(), f"54% {marker} Geneva 14\u00b0C".encode())
+
+
 def main():
+    failures = render_test()
     original_vt = open("/sys/class/tty/tty0/active").read().strip()[3:]
     active = [s for s in SERVICES if subprocess.run(
         ["systemctl", "is-active", "--quiet", s]).returncode == 0]
@@ -227,7 +254,6 @@ def main():
     time.sleep(0.3)
     daemon = subprocess.Popen([sys.executable, DAEMON])
     time.sleep(0.8)
-    failures = 0
     tmux = ["tmux", "-L", "tty-i3-keys-test"]
     try:
         # 1. Typing on a root-owned VT (no user: volume does nothing there).
