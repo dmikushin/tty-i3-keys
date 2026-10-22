@@ -67,8 +67,10 @@ sudo make test
 
 Switches to VT 12 for about a minute and drives a virtual keyboard
 through uinput. It checks that typing still works and that `Win+1` and the
-media keys type nothing, then tests brightness, tmux window switching on a
-real tmux, volume and mute with the tmux message, the `Win+Shift+S`
-toggle, and keymap restore. Volume, brightness and the lid state are put
+media keys type nothing. It checks that holding Win shows the i3blocks bar
+and releasing it restores the row byte-exact, keeping a program's redraw.
+It also tests brightness, volume, mute and the `Win+Shift+S` lid toggle
+with their messages at column 0, the row restore after a message, tmux
+window switching on a real tmux, and keymap restore. Volume, brightness and the lid state are put
 back afterwards. The real keyboards are grabbed while it runs, so typing
 does not disturb it.
