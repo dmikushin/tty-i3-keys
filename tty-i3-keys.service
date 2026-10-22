@@ -1,11 +1,12 @@
 [Unit]
-Description=i3 hotkeys on text consoles (Win+1..0 tmux windows, Win+Shift+S lid suspend)
+Description=i3 hotkeys on text consoles (Win+1..0 tmux windows, Win+Escape lock, Win+Shift+S lid suspend)
 
 [Service]
 ExecStart=/usr/local/bin/tty-i3-keys
 Restart=always
-# The toggle script leaves a systemd-inhibit process running; it must
-# survive restarts of this daemon.
+# The toggle script leaves a systemd-inhibit process running, and the
+# console lock (vlock) must keep the consoles locked: both must survive
+# restarts of this daemon.
 KillMode=process
 
 [Install]
