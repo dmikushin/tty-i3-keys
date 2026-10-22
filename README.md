@@ -6,16 +6,32 @@ foreground VT is in text mode (not X), acts for the user who owns that VT:
 
 | keys | action |
 |---|---|
+| `Win` held | the i3 bar's status line on the bottom row, like i3's `mode hide` bar with `modifier Mod4` |
 | `Win+1` .. `Win+9`, `Win+0` | select tmux window 1 .. 9, 10 in the session attached to the VT, like i3 workspaces |
 | `Win+Shift+S` | toggle suspend on lid close, by the same `~/.config/i3/toggle-lid-suspend.sh` as i3 (shared state with X) |
 | volume up / down, mute | `pamixer -ui 3`, `pamixer -ud 3`, `pamixer -t` as in the i3 config, in the user's PipeWire session |
 | brightness up / down | `brightnessctl set +5%` / `5%-` as in the i3 config (never down to 0) |
 
-Volume and brightness show the new level in tmux (`display-message`) when a
-tmux client is attached to the VT. Nothing is written into the tty, which
-would corrupt full-screen programs.
+Feedback appears in the same bar for 2.5 seconds, with the message at the
+left and the status at the right: the lid state, the volume and brightness
+level, and errors (no tmux window 7, no tmux on this console). Nothing is
+written into the tty, which would corrupt full-screen programs, and nothing
+depends on tmux. Levels have colors: info normal, warning yellow, error red.
 
 How it works:
+
+- The bar's content is the user's own `i3blocks`, the `status_command` of
+  their i3 bar. It runs persistently as the user (with no `DISPLAY`), and its
+  i3bar JSON stream is drawn into the screen memory through `/dev/vcsaN`, over
+  whatever program is on the VT, without moving the cursor or sending the
+  program anything. Text is mapped to the console font's glyphs. Icon-font
+  characters are dropped, and other missing characters get a compatibility
+  form (`℃` -> `°C`) or `?`. Colors map to the console palette. When the bar
+  goes away, a cell is put back only if it still shows the bar and the
+  program has not written there. The `/dev/vcsuN` text shadow, which only
+  program output changes, catches writes of identical cells. If the screen
+  scrolled meanwhile, the bar is found where it moved to. After a VT resize
+  the row is left as it is.
 
 - The kernel console has no Super modifier, so `Win+1` would also type `1`.
   The daemon makes both Win keys the kernel's `ShiftL` modifier in the
@@ -28,8 +44,10 @@ How it works:
 - Keys that the `KEYMAP_TOGGLE` file of `/etc/vconsole.conf` maps on purpose
   are left to the console. On a laptop whose `Fn+Left/Right` arrive as
   volume keys and are mapped to Home/End there, they stay Home/End.
-- tmux, pamixer and the lid script run as the owner of the VT, never as
-  root. Nothing is done for a root-owned (login) VT, except brightness.
+- tmux, pamixer, i3blocks and the lid script run as the owner of the VT,
+  with that user's groups, never as root. Their run time and output are
+  bounded. On a root-owned (login) VT only brightness acts, and it shows its
+  message without a status.
 
 ## Install
 
@@ -47,7 +65,7 @@ from outside their session (the daemon runs the lid script for them).
 sudo make test
 ```
 
-Switches to VT 12 for about 15 seconds and drives a virtual keyboard
+Switches to VT 12 for about a minute and drives a virtual keyboard
 through uinput. It checks that typing still works and that `Win+1` and the
 media keys type nothing, then tests brightness, tmux window switching on a
 real tmux, volume and mute with the tmux message, the `Win+Shift+S`

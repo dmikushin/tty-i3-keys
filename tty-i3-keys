@@ -10,15 +10,20 @@ is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
   Win+Shift+S            toggle suspend-on-lid-close: runs the same
                          ~/.config/i3/toggle-lid-suspend.sh as i3, so X and
                          the console share one state (the script's
-                         systemd-inhibit process and pidfile); the resulting
-                         state is printed on that VT.
+                         systemd-inhibit process and pidfile);
   volume up/down, mute   the commands of the i3 config (pamixer), run as the
                          VT's owner in their PipeWire session;
-  brightness up/down     brightnessctl, as in the i3 config (never to 0).
+  brightness up/down     brightnessctl, as in the i3 config (never to 0);
+  Win held               the i3 bar (i3's "mode hide" bar, "modifier Mod4").
 
-Volume and brightness show the new level in tmux (display-message) when a
-tmux client is attached to the VT; nothing is written into the tty, which
-would corrupt full-screen programs.
+The bar is the bottom row of the VT, drawn into the screen memory
+(/dev/vcsaN) over whatever program is there: the user's own i3blocks runs
+persistently as that user and its i3bar JSON stream is the right part.
+Feedback (lid state, volume, brightness, errors) pops up in the same bar,
+at the left, for a few seconds - nothing is written into the tty, which
+would corrupt full-screen programs. When the bar goes away, the row is put
+back wherever the screen still shows the bar; what the program wrote
+meanwhile is kept.
 
 Keys that the console keymap toggle file (KEYMAP_TOGGLE in
 /etc/vconsole.conf) maps on purpose are left to the console: on a laptop
@@ -32,11 +37,15 @@ combinations, so the kernel emits nothing for Win+key - except cursor and
 CSI keys (arrows), which it sends with the modifier encoded. The original
 keymap entries are restored on exit.
 """
+import ctypes
+import errno
 import fcntl
 import glob
 import gzip
+import json
 import os
 import pwd
+import re
 import select
 import signal
 import stat
@@ -45,6 +54,7 @@ import subprocess
 import sys
 import time
 import traceback
+import unicodedata
 
 EVENT = struct.Struct("llHHi")
 EV_KEY = 0x01
@@ -202,28 +212,6 @@ def foreground_text_vt():
     return tty if struct.unpack("i", mode)[0] == KD_TEXT else None
 
 
-def toggle(tty):
-    uid = os.stat(tty).st_uid
-    if uid == 0:
-        return  # login prompt: nobody to act for
-    user = pwd.getpwuid(uid)
-    script = os.path.join(user.pw_dir, SCRIPT)
-    # The inhibitor left running by "toggle" inherits stdout: never pipe it.
-    subprocess.run([script, "toggle"], user=uid, group=user.pw_gid,
-                   extra_groups=[], env=user_env(user),
-                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=COMMAND_SECONDS)
-    status = as_user(uid, [script, "status"]).strip()
-    # Never block on the tty (a stopped tty would hang the daemon).
-    fd = os.open(tty, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
-    try:
-        os.write(fd, f"\r\n[{status}]\r\n".encode())
-    except BlockingIOError:
-        pass
-    finally:
-        os.close(fd)
-
-
 def user_env(user):
     """The environment of the user's session (XDG_RUNTIME_DIR reaches their
     PipeWire), and nothing of root's."""
@@ -231,15 +219,22 @@ def user_env(user):
             "LANG": "C.UTF-8", "XDG_RUNTIME_DIR": f"/run/user/{user.pw_uid}"}
 
 
-def as_user(uid, argv):
-    """Run a command as `uid`, never as root, and return its standard
-    output. The command is the user's to control: it is killed after
-    COMMAND_SECONDS and only the first OUTPUT_LIMIT bytes are kept."""
+def user_identity(uid):
     user = pwd.getpwuid(uid)
+    return user, {"user": uid, "group": user.pw_gid,
+                  "extra_groups": os.getgrouplist(user.pw_name, user.pw_gid),
+                  "env": user_env(user)}
+
+
+def as_user(uid, argv, stderr=False):
+    """Run a command as `uid`, never as root; return (exit status, output).
+    The command is the user's to control: it is killed after
+    COMMAND_SECONDS and only the first OUTPUT_LIMIT bytes are kept. With
+    `stderr`, its error output is part of the output."""
+    _, identity = user_identity(uid)
     proc = subprocess.Popen(
-        argv, user=uid, group=user.pw_gid, extra_groups=[],
-        env=user_env(user), stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        argv, **identity, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if stderr else subprocess.DEVNULL,
         start_new_session=True)
     out = b""
     deadline = time.monotonic() + COMMAND_SECONDS
@@ -259,7 +254,24 @@ def as_user(uid, argv):
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
-    return out.decode(errors="replace")
+    return proc.returncode, out.decode(errors="replace").strip()
+
+
+# --- Actions; their feedback goes to the bar (Bar.notify) ----------------
+
+def toggle(tty, bar):
+    uid = os.stat(tty).st_uid
+    if uid == 0:
+        return  # login prompt: nobody to act for
+    user, identity = user_identity(uid)
+    script = os.path.join(user.pw_dir, SCRIPT)
+    # The inhibitor left running by "toggle" inherits stdout: never pipe it.
+    subprocess.run([script, "toggle"], **identity,
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=COMMAND_SECONDS)
+    status, text = as_user(uid, [script, "status"])
+    bar.notify(text or f"{SCRIPT} status failed",
+               INFO if status == 0 and text else ERROR)
 
 
 def tmux_client(tty, uid):
@@ -272,8 +284,8 @@ def tmux_client(tty, uid):
         try:
             if not stat.S_ISSOCK(os.lstat(sock).st_mode):
                 continue
-            clients = as_user(uid, ["tmux", "-S", sock, "list-clients", "-F",
-                                    "#{client_tty} #{session_id}"])
+            _, clients = as_user(uid, ["tmux", "-S", sock, "list-clients",
+                                       "-F", "#{client_tty} #{session_id}"])
         except OSError:
             continue
         for line in clients.splitlines():
@@ -283,56 +295,527 @@ def tmux_client(tty, uid):
     return None
 
 
-def select_window(tty, index):
+def select_window(tty, index, bar):
     """Select window `index` in the tmux session attached to `tty`."""
     uid = os.stat(tty).st_uid
     if uid == 0:
         return  # login prompt: nobody to act for
     client = tmux_client(tty, uid)
-    if client:
-        sock, session = client
-        # A missing window is an error tmux reports; nothing to do.
-        as_user(uid, ["tmux", "-S", sock, "select-window", "-t",
-                      f"{session}:{index}"])
-
-
-def show(tty, uid, message):
-    """Show `message` in the tmux client on `tty`, if there is one."""
-    if uid == 0:
+    if not client:
+        bar.notify("No tmux on this console", WARNING)
         return
-    client = tmux_client(tty, uid)
-    if client:
-        as_user(uid, ["tmux", "-S", client[0], "display-message", "-c", tty,
-                      message])
+    sock, session = client
+    status, error = as_user(uid, ["tmux", "-S", sock, "select-window", "-t",
+                                  f"{session}:{index}"], stderr=True)
+    if status != 0:
+        bar.notify(f"tmux: {error or f'no window {index}'}", ERROR)
 
 
-def volume(tty, code):
+def volume(tty, code, bar):
     uid = os.stat(tty).st_uid
     if uid == 0:
         return  # login prompt: no user session to change
-    as_user(uid, VOLUME[code])
+    status, error = as_user(uid, VOLUME[code], stderr=True)
+    if status != 0:
+        bar.notify(f"Volume: {error or 'pamixer failed'}", ERROR)
+        return
     # i3 also refreshes its status bar this way.
     as_user(uid, ["pkill", "-RTMIN+1", "-u", str(uid), "i3blocks"])
-    level = as_user(uid, ["pamixer", "--get-volume-human"]).strip()
-    show(tty, uid, f"Volume: {level}")
+    _, level = as_user(uid, ["pamixer", "--get-volume-human"])
+    bar.notify(f"Volume: {level}", INFO)
 
 
-def brightness(tty, code):
+def brightness(tty, code, bar):
     # brightnessctl keeps at least 1 (its default --min-value): never black.
-    subprocess.run(BRIGHTNESS[code], stdin=subprocess.DEVNULL,
-                   capture_output=True, timeout=5)
-    info = subprocess.run(["brightnessctl", "-m"], capture_output=True,
-                          text=True, timeout=5).stdout.split(",")
-    if len(info) > 3:
-        show(tty, os.stat(tty).st_uid, f"Brightness: {info[3]}")
+    run = lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL,
+                                      capture_output=True, text=True,
+                                      timeout=COMMAND_SECONDS)
+    result = run(BRIGHTNESS[code])
+    if result.returncode != 0:
+        bar.notify(f"Brightness: {result.stderr.strip() or 'failed'}", ERROR)
+        return
+    info = run(["brightnessctl", "-m"]).stdout.split(",")
+    bar.notify(f"Brightness: {info[3] if len(info) > 3 else '?'}", INFO)
 
 
-def handle(held, device, code, value, media_keys, last_media):
+# --- The bar: status while Win is held, and notifications ----------------
+
+GIO_UNIMAP, GIO_CMAP, KDFONTOP = 0x4B66, 0x4B70, 0x4B72
+KD_FONT_OP_GET_TALL = 5
+I3BLOCKS_RESTART_SECONDS = 5
+I3BLOCKS_LINE_LIMIT = 1 << 16
+MAX_BLOCKS = 32
+MAX_BLOCK_TEXT = 128
+MAX_SEPARATOR_CELLS = 4
+NOTIFY_SECONDS = 2.5
+FOLLOW_SECONDS = 0.5               # how soon a shown bar notices a VT switch
+INFO, WARNING, ERROR = "info", "warning", "error"
+LEVEL_FG = {INFO: (0xFF, 0xFF, 0xFF), WARNING: (0xFF, 0xFF, 0x00),
+            ERROR: (0xFF, 0x00, 0x00)}
+URGENT_BG = (0x90, 0x00, 0x00)     # i3bar's urgent block background
+BAR_BG = (0x00, 0x00, 0x00)        # i3bar's default background
+BAR_FG = (0xFF, 0xFF, 0xFF)
+SEPARATOR_FG = (0x66, 0x66, 0x66)  # i3bar's default separator colour
+PIXELS_PER_CELL = 10               # i3blocks widths are in pixels
+
+
+class UniPair(ctypes.Structure):
+    _fields_ = [("unicode", ctypes.c_ushort), ("fontpos", ctypes.c_ushort)]
+
+
+class UniMapDesc(ctypes.Structure):
+    _fields_ = [("entry_ct", ctypes.c_ushort),
+                ("entries", ctypes.POINTER(UniPair))]
+
+
+class ConsoleFontOp(ctypes.Structure):
+    _fields_ = [("op", ctypes.c_uint), ("flags", ctypes.c_uint),
+                ("width", ctypes.c_uint), ("height", ctypes.c_uint),
+                ("charcount", ctypes.c_uint),
+                ("data", ctypes.c_void_p)]
+
+
+LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def ioctl(fd, request, arg):
+    if LIBC.ioctl(fd, ctypes.c_ulong(request), ctypes.byref(arg)) != 0:
+        return ctypes.get_errno()
+    return 0
+
+
+def glyph_count(fd):
+    """The console font's glyph count (256 or 512), from the font itself:
+    with 512 glyphs the 9th glyph bit lives in the screen cell word."""
+    for height in (128, 64, 32):
+        op = ConsoleFontOp(KD_FONT_OP_GET_TALL, 0, 64, height, 512, None)
+        if ioctl(fd, KDFONTOP, op) == 0:
+            return op.charcount
+    raise OSError("KDFONTOP: cannot read the font metadata")
+
+
+def font_map(fd):
+    """The console font's Unicode map {character: glyph} and whether the
+    font has 512 glyphs."""
+    desc = UniMapDesc(0, None)
+    error = ioctl(fd, GIO_UNIMAP, desc)     # sizing call: ENOMEM + count
+    if error not in (0, errno.ENOMEM):
+        raise OSError(error, "GIO_UNIMAP")
+    pairs = (UniPair * desc.entry_ct)()
+    desc = UniMapDesc(len(pairs), ctypes.cast(pairs, ctypes.POINTER(UniPair)))
+    error = ioctl(fd, GIO_UNIMAP, desc)
+    if error:
+        raise OSError(error, "GIO_UNIMAP")
+    glyphs = {}
+    for pair in pairs[:desc.entry_ct]:
+        glyphs.setdefault(chr(pair.unicode), pair.fontpos)
+    return glyphs, glyph_count(fd) > 256
+
+
+def palette(fd):
+    buf = bytearray(48)
+    fcntl.ioctl(fd, GIO_CMAP, buf)
+    return [tuple(buf[i:i + 3]) for i in range(0, 48, 3)]
+
+
+def nearest(rgb, colors):
+    return min(range(len(colors)),
+               key=lambda i: sum((a - b) ** 2 for a, b in zip(rgb, colors[i])))
+
+
+def parse_color(text, default):
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})(?:[0-9a-fA-F]{2})?",
+                     text if isinstance(text, str) else "")
+    return tuple(bytes.fromhex(m.group(1))) if m else default
+
+
+def is_icon(ch):
+    """Private-use code points: icon-font glyphs, which no console font has."""
+    o = ord(ch)
+    return 0xE000 <= o <= 0xF8FF or o >= 0xF0000
+
+
+class I3Blocks:
+    """The user's i3blocks, the status_command of their i3 bar, run as the
+    user with their session environment and no DISPLAY. Its stdout is the
+    i3bar protocol: a header line, then an endless JSON array whose elements
+    (one per line) are the current list of blocks. Its output is the user's
+    to control, so lines and block lists are bounded."""
+
+    def __init__(self, uid):
+        self.uid = uid
+        self.blocks = []
+        self.proc = None
+        self.started = 0.0
+        self.buf = b""
+        self.lines = 0
+
+    def ensure_running(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        if time.monotonic() - self.started < I3BLOCKS_RESTART_SECONDS:
+            return
+        self.stop()
+        user, identity = user_identity(self.uid)
+        self.started = time.monotonic()
+        try:
+            self.proc = subprocess.Popen(
+                ["i3blocks"], **identity, cwd=user.pw_dir,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            self.proc = None
+            return
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.buf, self.lines = b"", 0
+
+    def fileno(self):
+        return self.proc.stdout.fileno() if self.proc else None
+
+    def read(self):
+        """Consume output; True if the block list changed."""
+        try:
+            data = os.read(self.fileno(), 65536)
+        except BlockingIOError:
+            return False
+        except OSError:
+            data = b""
+        if not data:            # i3blocks exited: restarted at a later scan
+            self.stop()
+            return False
+        *lines, self.buf = (self.buf + data).split(b"\n")
+        if len(self.buf) > I3BLOCKS_LINE_LIMIT:
+            self.buf = b""
+        changed = False
+        for line in lines:
+            if len(line) <= I3BLOCKS_LINE_LIMIT:
+                changed |= self.parse(line.strip())
+        return changed
+
+    def parse(self, line):
+        self.lines += 1
+        if self.lines == 1:     # the header
+            return False
+        if self.lines == 2 and line.startswith(b"["):
+            line = line[1:]     # the start of the endless array
+        line = line.lstrip(b",")
+        try:
+            blocks = json.loads(line)
+        except ValueError:
+            return False
+        if not isinstance(blocks, list):
+            return False
+        self.blocks = [b for b in blocks if isinstance(b, dict)][:MAX_BLOCKS]
+        return True
+
+    def stop(self):
+        if not self.proc:
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(self.proc.pid, sig)
+            except OSError:
+                pass
+            try:
+                self.proc.wait(1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        self.proc.stdout.close()
+        self.proc = None
+
+
+def text_cells(text, fg, bg, glyphs):
+    out = []
+    for ch in text[:MAX_BLOCK_TEXT]:
+        if is_icon(ch):
+            continue
+        if ch in glyphs:
+            out.append((glyphs[ch], fg, bg))
+            continue
+        # A compatibility form the font has: U+2103 -> degree sign, C.
+        alt = unicodedata.normalize("NFKD", ch)
+        if alt != ch and all(c in glyphs for c in alt):
+            out += [(glyphs[c], fg, bg) for c in alt]
+        else:
+            out.append((glyphs.get("?", ord("?")), fg, bg))
+    return out
+
+
+def render(blocks, message, cols, glyphs, colors, hi_font):
+    """The bar as screen cells: the message (text, level) at the left, the
+    status right-aligned like i3bar's - full_text if everything fits, else
+    short_text, else cut on the left."""
+    fg_default = nearest(BAR_FG, colors)
+    bg_default = nearest(BAR_BG, colors[:8])
+    space = (glyphs.get(" ", 32), fg_default, bg_default)
+
+    def status(short):
+        row = []
+        for n, block in enumerate(blocks):
+            text = block.get("short_text") if short else None
+            text = text or block.get("full_text") or ""
+            if not isinstance(text, str):
+                continue
+            if block.get("markup") == "pango":
+                text = re.sub(r"<[^>]*>", "", text)
+            text = text.strip()
+            if not text:
+                continue
+            fg = nearest(parse_color(block.get("color"), BAR_FG), colors)
+            bg = bg_default
+            if block.get("urgent") is True:
+                fg, bg = fg_default, nearest(URGENT_BG, colors[:8])
+            elif block.get("background"):
+                bg = nearest(parse_color(block["background"], BAR_BG),
+                             colors[:8])
+            row += text_cells(text, fg, bg, glyphs)
+            if n < len(blocks) - 1:
+                width = block.get("separator_block_width", 9)
+                width = width if isinstance(width, int) else 9
+                gap = min(MAX_SEPARATOR_CELLS,
+                          max(1, round(width / PIXELS_PER_CELL)))
+                sep = [space] * gap
+                if block.get("separator", True):
+                    sep[gap // 2] = (glyphs.get("|", ord("|")),
+                                     nearest(SEPARATOR_FG, colors), bg_default)
+                row += sep
+        return row + [space]
+
+    left = []
+    if message:
+        text, level = message
+        fg = nearest(LEVEL_FG[level], colors)
+        left = text_cells(text, fg, bg_default, glyphs) + [space]
+        left = left[:cols]
+    room = cols - len(left)
+    right = status(False)
+    if len(right) > room:
+        right = status(True)
+    right = right[len(right) - room:] if room > 0 else []
+    row = left + [space] * (room - len(right)) + right
+
+    out = bytearray()
+    for glyph, fg, bg in row:
+        attr = (bg << 4) | fg
+        if hi_font:     # fbcon 512-glyph fonts: attr shifted up by one bit
+            word = (glyph & 0x1FF) | ((attr & 0x7F) << 9)
+        else:
+            word = (glyph & 0xFF) | (attr << 8)
+        out += struct.pack("=H", word)
+    return bytes(out)
+
+
+class Screen:
+    """The bottom row of one VT, as /dev/vcsaN cells (2 bytes) and as the
+    /dev/vcsuN text shadow (4 bytes a cell). The shadow is kept by the
+    kernel from what programs write and is not touched by vcsa writes, so it
+    tells a program's write apart from ours even when the cells are equal."""
+
+    def __init__(self, tty):
+        n = tty.removeprefix("/dev/tty")
+        self.vcsa, self.vcsu = f"/dev/vcsa{n}", f"/dev/vcsu{n}"
+        with open(self.vcsa, "rb") as f:
+            self.rows, self.cols = f.read(2)
+
+    def size(self):
+        with open(self.vcsa, "rb") as f:
+            return tuple(f.read(2))
+
+    def read(self, row):
+        """(cells, text shadow) of a row, or None if the read came short."""
+        with open(self.vcsa, "rb") as a, open(self.vcsu, "rb") as u:
+            cells = os.pread(a.fileno(), self.cols * 2,
+                             4 + row * self.cols * 2)
+            text = os.pread(u.fileno(), self.cols * 4, row * self.cols * 4)
+        if len(cells) != self.cols * 2 or len(text) != self.cols * 4:
+            return None
+        return cells, text
+
+    def write(self, row, col, cells):
+        with open(self.vcsa, "r+b") as a:
+            if os.pwrite(a.fileno(), cells,
+                         4 + (row * self.cols + col) * 2) != len(cells):
+                raise OSError(f"{self.vcsa}: short write")
+
+
+class Bar:
+    """The bottom row of the foreground VT, drawn over whatever program is
+    there: the i3blocks status while Win is held, and notifications for a
+    few seconds. Cells go through /dev/vcsaN, which neither moves the cursor
+    nor reaches the program. When the bar goes away, a cell is put back only
+    if it still shows the bar and the program has not written there (vcsu)."""
+
+    def __init__(self):
+        self.shown = None       # what is on screen, see show()
+        self.win = False        # Win is held
+        self.message = None     # (text, level)
+        self.expires = 0.0
+        self.i3blocks = {}      # uid -> I3Blocks
+
+    def blocks_for(self, uid):
+        if uid not in self.i3blocks:
+            self.i3blocks[uid] = I3Blocks(uid)
+        self.i3blocks[uid].ensure_running()
+        return self.i3blocks[uid]
+
+    # The API for the rest of the daemon.
+
+    def win_down(self):
+        self.win = True
+        self.refresh()
+
+    def win_up(self):
+        self.win = False
+        self.refresh()
+
+    def notify(self, text, level=INFO):
+        """Show `text` at the left of the bar for NOTIFY_SECONDS; a new
+        message replaces the old one and restarts the timer."""
+        self.message = (" ".join(str(text).split()), level)
+        self.expires = time.monotonic() + NOTIFY_SECONDS
+        self.refresh()
+
+    def timeout(self):
+        """Seconds until the message expires, for the event loop."""
+        return max(0.0, self.expires - time.monotonic()) if self.message else None
+
+    def tick(self):
+        if self.message and time.monotonic() >= self.expires:
+            self.message = None
+            self.refresh()
+
+    def update(self, uid):
+        if self.shown and self.shown["uid"] == uid:
+            self.refresh()
+
+    def follow(self):
+        """While shown: notice a VT switch or a new owner of the VT, which
+        nothing else reports, and move or drop the bar."""
+        if not self.shown:
+            return
+        tty = foreground_text_vt()
+        if tty != self.shown["tty"] or os.stat(tty).st_uid != self.shown["uid"]:
+            self.refresh()
+
+    # Drawing.
+
+    def refresh(self):
+        tty = foreground_text_vt()
+        uid = os.stat(tty).st_uid if tty else None
+        # Win alone on a login VT: there is no status to show.
+        wanted = tty and (self.message or (self.win and uid != 0))
+        if self.shown and (not wanted or self.shown["tty"] != tty
+                           or self.shown["uid"] != uid):
+            self.hide()     # a new session on the VT is a new screen
+        if not wanted:
+            return
+        if not self.shown:
+            screen = Screen(tty)
+            row = screen.rows - 1
+            snapshot = screen.read(row)
+            if snapshot is None:
+                return
+            self.shown = {"tty": tty, "uid": uid, "screen": screen,
+                          "row": row, "saved": bytearray(snapshot[0]),
+                          "text": snapshot[1], "written": None}
+        self.draw()
+
+    def draw(self):
+        shown = self.shown
+        screen = shown["screen"]
+        if screen.size() != (screen.rows, screen.cols):
+            self.shown = None   # resized: our row is gone; leave it
+            return
+        blocks = self.blocks_for(shown["uid"]).blocks if shown["uid"] else []
+        tfd = os.open(shown["tty"], os.O_RDONLY | os.O_NOCTTY)
+        try:
+            glyphs, hi_font = font_map(tfd)
+            colors = palette(tfd)
+        finally:
+            os.close(tfd)
+        row = render(blocks, self.message, screen.cols, glyphs, colors,
+                     hi_font)
+        if shown["written"] is not None:
+            # Cells the program redrew under the bar are its new content.
+            current = screen.read(shown["row"])
+            if current is None:
+                return
+            for i in range(screen.cols):
+                if self.changed(current, i):
+                    shown["saved"][2 * i:2 * i + 2] = current[0][2 * i:2 * i + 2]
+            shown["text"] = current[1]
+        screen.write(shown["row"], 0, row)
+        shown["written"] = row
+
+    def changed(self, current, i):
+        """Has cell i been written by the program since we drew it?"""
+        shown = self.shown
+        cells, text = current
+        return (cells[2 * i:2 * i + 2] != shown["written"][2 * i:2 * i + 2]
+                or text[4 * i:4 * i + 4] != shown["text"][4 * i:4 * i + 4])
+
+    def hide(self):
+        shown, self.shown = self.shown, None
+        if not shown or shown["written"] is None:
+            return
+        self.shown = shown      # for changed()
+        try:
+            screen = shown["screen"]
+            if screen.size() != (screen.rows, screen.cols):
+                return
+            # The screen may have scrolled while the bar was up: then the bar
+            # is higher up, recognised by all its visible (non-blank) cells.
+            # Blank cells prove nothing - a program's blank line matches.
+            written = shown["written"]
+            blank = written[-2:]        # the bar always ends with a space
+            visible = [i for i in range(screen.cols)
+                       if written[2 * i:2 * i + 2] != blank]
+            for row in range(shown["row"], -1, -1):
+                current = screen.read(row)
+                if current is None:
+                    return
+                kept = [i for i in range(screen.cols)
+                        if not self.changed(current, i)]
+                if row == shown["row"] and kept:
+                    break
+                if visible and set(visible) <= set(kept):
+                    break
+            else:
+                return
+            i = 0
+            while i < len(kept):        # restore runs of untouched cells
+                j = i
+                while j + 1 < len(kept) and kept[j + 1] == kept[j] + 1:
+                    j += 1
+                a, b = kept[i], kept[j] + 1
+                screen.write(row, a, bytes(shown["saved"][2 * a:2 * b]))
+                i = j + 1
+        finally:
+            self.shown = None
+
+    def fds(self):
+        return {b.fileno(): b for b in self.i3blocks.values()
+                if b.fileno() is not None}
+
+    def stop(self):
+        self.win, self.message = False, None
+        self.hide()
+        for b in self.i3blocks.values():
+            b.stop()
+
+
+def handle(held, device, code, value, media_keys, last_media, bar):
     """One key event from any keyboard."""
     if value == 0:
         held.discard(code)
+        if code in WIN and not held & WIN:
+            bar.win_up()
         return
+    first_win = code in WIN and value == 1 and not held & WIN
     held.add(code)
+    if first_win:
+        bar.win_down()
     if code in media_keys:
         # One press can arrive from two devices: the first device to report
         # it owns the press, and only its repeats (value 2, which keep
@@ -347,21 +830,21 @@ def handle(held, device, code, value, media_keys, last_media):
             return
         tty = foreground_text_vt()
         if tty:
-            (volume if code in VOLUME else brightness)(tty, code)
+            (volume if code in VOLUME else brightness)(tty, code, bar)
         return
     if value != 1 or not held & WIN or held & CTRL_ALT:
         return
     if code == KEY_S and held & SHIFT:
         tty = foreground_text_vt()
         if tty:
-            toggle(tty)
+            toggle(tty, bar)
     elif code in WINDOW_KEYS and not held & SHIFT:
         tty = foreground_text_vt()
         if tty:
-            select_window(tty, WINDOW_KEYS[code])
+            select_window(tty, WINDOW_KEYS[code], bar)
 
 
-def run(keymap, media_keys):
+def run(keymap, media_keys, bar):
     fds = {}
     held = set()
     last_media = {}
@@ -371,11 +854,33 @@ def run(keymap, media_keys):
             try:
                 scan(fds, media_keys)
                 keymap.apply()
+                # Keep the bar's content ready for the user in front.
+                tty = foreground_text_vt()
+                if tty and os.stat(tty).st_uid != 0:
+                    bar.blocks_for(os.stat(tty).st_uid)
             except Exception:   # retried at the next scan
                 traceback.print_exc()
             next_scan = time.monotonic() + RESCAN_SECONDS
-        ready, _, _ = select.select(list(fds), [], [], RESCAN_SECONDS)
+        status = bar.fds()
+        wait = RESCAN_SECONDS
+        if bar.timeout() is not None:
+            wait = min(wait, bar.timeout())
+        if bar.shown:
+            wait = min(wait, FOLLOW_SECONDS)
+        ready, _, _ = select.select(list(fds) + list(status), [], [], wait)
+        try:
+            bar.tick()
+            bar.follow()
+        except Exception:
+            traceback.print_exc()
         for fd in ready:
+            if fd in status:
+                try:
+                    if status[fd].read():
+                        bar.update(status[fd].uid)
+                except Exception:
+                    traceback.print_exc()
+                continue
             try:
                 data = os.read(fd, EVENT.size * 64)
             except BlockingIOError:
@@ -385,6 +890,8 @@ def run(keymap, media_keys):
             if not data:  # device unplugged: forget what it held down
                 os.close(fd)
                 del fds[fd]
+                if held & WIN:
+                    bar.win_up()
                 held.clear()
                 continue
             for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
@@ -392,7 +899,7 @@ def run(keymap, media_keys):
                 if type_ != EV_KEY:
                     continue
                 try:
-                    handle(held, fd, code, value, media_keys, last_media)
+                    handle(held, fd, code, value, media_keys, last_media, bar)
                 except Exception:   # one failed action must not end the daemon
                     traceback.print_exc()
 
@@ -407,11 +914,15 @@ def main():
     entries = {code: K_SHIFTL for code in WIN}
     entries.update({code: K_HOLE for code in media_keys})
     keymap = Keymap(entries)
+    bar = Bar()
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     try:
-        run(keymap, media_keys)
+        run(keymap, media_keys, bar)
     finally:
-        keymap.restore()
+        try:
+            bar.stop()
+        finally:
+            keymap.restore()
 
 
 if __name__ == "__main__":
