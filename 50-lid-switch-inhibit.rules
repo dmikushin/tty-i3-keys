@@ -1,5 +1,5 @@
 // Let wheel users block lid-switch handling from outside their session, so
-// tty-lid-toggle-hotkey can run toggle-lid-suspend.sh on their behalf.
+// tty-i3-keys can run toggle-lid-suspend.sh on their behalf.
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.login1.inhibit-handle-lid-switch" &&
         subject.isInGroup("wheel")) {

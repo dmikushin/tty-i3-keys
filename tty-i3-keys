@@ -1,20 +1,50 @@
 #!/usr/bin/python3
-"""Win+Shift+S on the text console: toggle suspend-on-lid-close.
+"""i3 hotkeys on the Linux text console.
 
-i3 binds the same chord to ~/.config/i3/toggle-lid-suspend.sh, but on a text
-VT nothing listens for it. This daemon reads every keyboard's evdev node and,
-when the chord is pressed while the foreground VT is in text mode (KD_TEXT,
-i.e. not X), runs that same script as the user who owns the VT, so X and the
-console share one state (the script's systemd-inhibit process and pidfile).
-The resulting state is printed on that VT.
+On a text VT nothing listens for the i3 chords. This daemon reads every
+keyboard's evdev node and, when a chord is pressed while the foreground VT
+is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
+
+  Win+1 .. Win+9, Win+0  select tmux window 1 .. 9, 10 in the tmux session
+                         attached to that VT, like i3's workspace keys;
+  Win+Shift+S            toggle suspend-on-lid-close: runs the same
+                         ~/.config/i3/toggle-lid-suspend.sh as i3, so X and
+                         the console share one state (the script's
+                         systemd-inhibit process and pidfile); the resulting
+                         state is printed on that VT.
+  volume up/down, mute   the commands of the i3 config (pamixer), run as the
+                         VT's owner in their PipeWire session;
+  brightness up/down     brightnessctl, as in the i3 config (never to 0).
+
+Volume and brightness show the new level in tmux (display-message) when a
+tmux client is attached to the VT; nothing is written into the tty, which
+would corrupt full-screen programs.
+
+Keys that the console keymap toggle file (KEYMAP_TOGGLE in
+/etc/vconsole.conf) maps on purpose are left to the console: on a laptop
+whose Fn+Left/Right arrive as volume keys and are mapped to Home/End there,
+they stay Home/End.
+
+The kernel console has no Super modifier, so Win+1 would also type "1" into
+the program. The daemon therefore turns both Win keys into the kernel's
+ShiftL modifier in the console keymap: the keymap has no tables for ShiftL
+combinations, so the kernel emits nothing for Win+key - except cursor and
+CSI keys (arrows), which it sends with the modifier encoded. The original
+keymap entries are restored on exit.
 """
 import fcntl
 import glob
+import gzip
 import os
 import pwd
 import select
+import signal
+import stat
 import struct
 import subprocess
+import sys
+import time
+import traceback
 
 EVENT = struct.Struct("llHHi")
 EV_KEY = 0x01
@@ -22,14 +52,117 @@ KEY_LEFTSHIFT, KEY_RIGHTSHIFT = 42, 54
 KEY_LEFTMETA, KEY_RIGHTMETA = 125, 126
 KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT = 29, 97, 56, 100
 KEY_S = 31
+KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
+KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
+# The commands bound to these keys in ~/.config/i3/config.
+VOLUME = {KEY_VOLUMEUP: ["pamixer", "-ui", "3"],
+          KEY_VOLUMEDOWN: ["pamixer", "-ud", "3"],
+          KEY_MUTE: ["pamixer", "-t"]}
+BRIGHTNESS = {KEY_BRIGHTNESSUP: ["brightnessctl", "-q", "set", "+5%"],
+              KEY_BRIGHTNESSDOWN: ["brightnessctl", "-q", "set", "5%-"]}
+# The same key press can reach us from two devices (ThinkPad Extra Buttons
+# and Video Bus both report brightness): one action per this many seconds.
+DUPLICATE_SECONDS = 0.1
+# Bounds on commands run for a user (they may be the user's own programs).
+COMMAND_SECONDS = 3
+OUTPUT_LIMIT = 4096
+MAX_TMUX_SOCKETS = 8
+K_HOLE = 0x0200
+# KEY_1 .. KEY_9, KEY_0 -> tmux window 1 .. 9, 10.
+WINDOW_KEYS = {code: code - 1 for code in range(2, 12)}
 EVIOCGBIT_EV_KEY = 0x80604521  # EVIOCGBIT(EV_KEY, 96)
 KDGETMODE, KD_TEXT = 0x4B3B, 0x00
+KDGKBENT, KDSKBENT = 0x4B46, 0x4B47
+K_NOSUCHMAP = 0x027F            # KDGKBENT on entry 0 of a missing table
+K_SHIFTL = 0x0704               # K(KT_SHIFT, KG_SHIFTL)
+KG_SHIFTL_BIT = 1 << 4
+NR_KEYMAPS = 256
 SCRIPT = ".config/i3/toggle-lid-suspend.sh"
 RESCAN_SECONDS = 5
+WIN = {KEY_LEFTMETA, KEY_RIGHTMETA}
+SHIFT = {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
+CTRL_ALT = {KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT}
 
 
-def is_keyboard(path):
-    """True if the device reports both KEY_S and KEY_LEFTMETA."""
+def console_toggle_keys():
+    """Keycodes mapped by the KEYMAP_TOGGLE file of /etc/vconsole.conf: the
+    user's deliberate console bindings, which this daemon leaves alone."""
+    try:
+        with open("/etc/vconsole.conf") as f:
+            conf = dict(line.strip().split("=", 1) for line in f
+                        if "=" in line and not line.lstrip().startswith("#"))
+        path = conf.get("KEYMAP_TOGGLE", "").strip('"')
+        if not path.startswith("/"):
+            return set()
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt") as f:
+            return {int(line.split()[1]) for line in f
+                    if line.split()[:1] == ["keycode"]}
+    except (OSError, ValueError, IndexError):
+        return set()
+
+
+class Keymap:
+    """Console keymap entries this daemon owns, set in every allocated table:
+    the Win keys become the kernel's ShiftL modifier - no table for a ShiftL
+    combination exists (checked), so the kernel types nothing for Win+key
+    (but arrows: KT_CUR/KT_CSI keys fall back to the plain map) and
+    recomputes the modifier state when Win is released - and the media
+    keys it handles become holes, so they do not also type F13/F14/Help.
+    Only allocated tables are touched: writing even a hole into a missing
+    table allocates it. Re-applied if something reloads the keymap
+    (loadkeys, systemd-vconsole-setup); restored on exit."""
+
+    def __init__(self, entries):
+        self.fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+        self.entries = entries      # keycode -> value to set
+        self.saved = {}             # (table, keycode) -> original entry
+        self.warned = False
+
+    def get(self, table, keycode):
+        buf = bytearray(struct.pack("BBH", table, keycode, 0))
+        fcntl.ioctl(self.fd, KDGKBENT, buf)
+        return struct.unpack("BBH", buf)[2]
+
+    def set(self, table, keycode, value):
+        fcntl.ioctl(self.fd, KDSKBENT, struct.pack("BBH", table, keycode, value))
+
+    def tables(self):
+        return [t for t in range(NR_KEYMAPS) if self.get(t, 0) != K_NOSUCHMAP]
+
+    def apply(self):
+        tables = self.tables()
+        entries = self.entries
+        clash = [t for t in tables if t & KG_SHIFTL_BIT]
+        if clash:
+            # Win as ShiftL would select these tables and type their keys.
+            if not self.warned:
+                print(f"keymap uses ShiftL (tables {clash}): Win keys left "
+                      "alone, Win+key will also type", flush=True)
+                self.warned = True
+            entries = {k: v for k, v in entries.items() if v != K_SHIFTL}
+        for table in tables:
+            for keycode, wanted in entries.items():
+                value = self.get(table, keycode)
+                if value != wanted:
+                    self.saved[table, keycode] = value
+                    self.set(table, keycode, wanted)
+
+    def restore(self):
+        """Put back the entries as they were when last set: after a keymap
+        reload that is the reloaded value, which is the one to keep."""
+        tables = set(self.tables())
+        for (table, keycode), value in self.saved.items():
+            if table in tables:
+                try:
+                    self.set(table, keycode, value)
+                except OSError:
+                    traceback.print_exc()
+
+
+def is_keyboard(path, media_keys):
+    """The device's fd if it is a keyboard (KEY_S and KEY_LEFTMETA) or
+    reports one of the media keys handled here, else None."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
@@ -41,17 +174,17 @@ def is_keyboard(path):
         os.close(fd)
         return None
     has = lambda code: bits[code // 8] >> (code % 8) & 1
-    if has(KEY_S) and has(KEY_LEFTMETA):
+    if (has(KEY_S) and has(KEY_LEFTMETA)) or any(map(has, media_keys)):
         return fd
     os.close(fd)
     return None
 
 
-def scan(open_fds):
+def scan(open_fds, media_keys):
     known = set(open_fds.values())
     for path in glob.glob("/dev/input/event*"):
         if path not in known:
-            fd = is_keyboard(path)
+            fd = is_keyboard(path, media_keys)
             if fd is not None:
                 open_fds[fd] = path
 
@@ -75,49 +208,210 @@ def toggle(tty):
         return  # login prompt: nobody to act for
     user = pwd.getpwuid(uid)
     script = os.path.join(user.pw_dir, SCRIPT)
-    run = lambda arg, out: subprocess.run(
-        ["runuser", "-u", user.pw_name, "--", script, arg],
-        env={"HOME": user.pw_dir, "PATH": "/usr/local/bin:/usr/bin"},
-        stdout=out, stderr=subprocess.DEVNULL, text=True)
     # The inhibitor left running by "toggle" inherits stdout: never pipe it.
-    run("toggle", subprocess.DEVNULL)
-    status = run("status", subprocess.PIPE).stdout.strip()
-    with open(tty, "w") as f:
-        f.write(f"\r\n[{status}]\r\n")
+    subprocess.run([script, "toggle"], user=uid, group=user.pw_gid,
+                   extra_groups=[], env=user_env(user),
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=COMMAND_SECONDS)
+    status = as_user(uid, [script, "status"]).strip()
+    # Never block on the tty (a stopped tty would hang the daemon).
+    fd = os.open(tty, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        os.write(fd, f"\r\n[{status}]\r\n".encode())
+    except BlockingIOError:
+        pass
+    finally:
+        os.close(fd)
 
 
-def main():
+def user_env(user):
+    """The environment of the user's session (XDG_RUNTIME_DIR reaches their
+    PipeWire), and nothing of root's."""
+    return {"HOME": user.pw_dir, "PATH": "/usr/local/bin:/usr/bin",
+            "LANG": "C.UTF-8", "XDG_RUNTIME_DIR": f"/run/user/{user.pw_uid}"}
+
+
+def as_user(uid, argv):
+    """Run a command as `uid`, never as root, and return its standard
+    output. The command is the user's to control: it is killed after
+    COMMAND_SECONDS and only the first OUTPUT_LIMIT bytes are kept."""
+    user = pwd.getpwuid(uid)
+    proc = subprocess.Popen(
+        argv, user=uid, group=user.pw_gid, extra_groups=[],
+        env=user_env(user), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    out = b""
+    deadline = time.monotonic() + COMMAND_SECONDS
+    try:
+        while len(out) < OUTPUT_LIMIT:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([proc.stdout], [], [], left)[0]:
+                break
+            chunk = os.read(proc.stdout.fileno(), OUTPUT_LIMIT - len(out))
+            if not chunk:
+                break
+            out += chunk
+    finally:
+        proc.stdout.close()
+        try:
+            proc.wait(max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+    return out.decode(errors="replace")
+
+
+def tmux_client(tty, uid):
+    """(socket, session id) of the tmux client attached to `tty`, or None.
+    tmux runs as the VT's owner, never as root: its socket directory belongs
+    to the user, and a root client would act on whatever the user put there.
+    A root daemon has no $TMUX_TMPDIR: look in tmux's default directory."""
+    # The directory is the user's: bound how many sockets we ask.
+    for sock in sorted(glob.glob(f"/tmp/tmux-{uid}/*"))[:MAX_TMUX_SOCKETS]:
+        try:
+            if not stat.S_ISSOCK(os.lstat(sock).st_mode):
+                continue
+            clients = as_user(uid, ["tmux", "-S", sock, "list-clients", "-F",
+                                    "#{client_tty} #{session_id}"])
+        except OSError:
+            continue
+        for line in clients.splitlines():
+            client_tty, _, session = line.partition(" ")
+            if client_tty == tty:
+                return sock, session
+    return None
+
+
+def select_window(tty, index):
+    """Select window `index` in the tmux session attached to `tty`."""
+    uid = os.stat(tty).st_uid
+    if uid == 0:
+        return  # login prompt: nobody to act for
+    client = tmux_client(tty, uid)
+    if client:
+        sock, session = client
+        # A missing window is an error tmux reports; nothing to do.
+        as_user(uid, ["tmux", "-S", sock, "select-window", "-t",
+                      f"{session}:{index}"])
+
+
+def show(tty, uid, message):
+    """Show `message` in the tmux client on `tty`, if there is one."""
+    if uid == 0:
+        return
+    client = tmux_client(tty, uid)
+    if client:
+        as_user(uid, ["tmux", "-S", client[0], "display-message", "-c", tty,
+                      message])
+
+
+def volume(tty, code):
+    uid = os.stat(tty).st_uid
+    if uid == 0:
+        return  # login prompt: no user session to change
+    as_user(uid, VOLUME[code])
+    # i3 also refreshes its status bar this way.
+    as_user(uid, ["pkill", "-RTMIN+1", "-u", str(uid), "i3blocks"])
+    level = as_user(uid, ["pamixer", "--get-volume-human"]).strip()
+    show(tty, uid, f"Volume: {level}")
+
+
+def brightness(tty, code):
+    # brightnessctl keeps at least 1 (its default --min-value): never black.
+    subprocess.run(BRIGHTNESS[code], stdin=subprocess.DEVNULL,
+                   capture_output=True, timeout=5)
+    info = subprocess.run(["brightnessctl", "-m"], capture_output=True,
+                          text=True, timeout=5).stdout.split(",")
+    if len(info) > 3:
+        show(tty, os.stat(tty).st_uid, f"Brightness: {info[3]}")
+
+
+def handle(held, device, code, value, media_keys, last_media):
+    """One key event from any keyboard."""
+    if value == 0:
+        held.discard(code)
+        return
+    held.add(code)
+    if code in media_keys:
+        # One press can arrive from two devices: the first device to report
+        # it owns the press, and only its repeats (value 2, which keep
+        # changing the level as under X) act.
+        now = time.monotonic()
+        when, owner = last_media.get(code, (0.0, None))
+        if value == 1:
+            if owner != device and now - when < DUPLICATE_SECONDS:
+                return
+            last_media[code] = (now, device)
+        elif owner != device:
+            return
+        tty = foreground_text_vt()
+        if tty:
+            (volume if code in VOLUME else brightness)(tty, code)
+        return
+    if value != 1 or not held & WIN or held & CTRL_ALT:
+        return
+    if code == KEY_S and held & SHIFT:
+        tty = foreground_text_vt()
+        if tty:
+            toggle(tty)
+    elif code in WINDOW_KEYS and not held & SHIFT:
+        tty = foreground_text_vt()
+        if tty:
+            select_window(tty, WINDOW_KEYS[code])
+
+
+def run(keymap, media_keys):
     fds = {}
     held = set()
-    scan(fds)
+    last_media = {}
+    next_scan = 0.0
     while True:
+        if time.monotonic() >= next_scan:
+            try:
+                scan(fds, media_keys)
+                keymap.apply()
+            except Exception:   # retried at the next scan
+                traceback.print_exc()
+            next_scan = time.monotonic() + RESCAN_SECONDS
         ready, _, _ = select.select(list(fds), [], [], RESCAN_SECONDS)
-        if not ready:
-            scan(fds)
-            continue
         for fd in ready:
             try:
                 data = os.read(fd, EVENT.size * 64)
-            except OSError:  # device unplugged
+            except BlockingIOError:
+                continue
+            except OSError:
+                data = b""
+            if not data:  # device unplugged: forget what it held down
                 os.close(fd)
                 del fds[fd]
+                held.clear()
                 continue
             for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
                 _, _, type_, code, value = EVENT.unpack_from(data, i)
                 if type_ != EV_KEY:
                     continue
-                if value == 0:
-                    held.discard(code)
-                    continue
-                held.add(code)
-                if (value == 1 and code == KEY_S
-                        and held & {KEY_LEFTMETA, KEY_RIGHTMETA}
-                        and held & {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
-                        and not held & {KEY_LEFTCTRL, KEY_RIGHTCTRL,
-                                        KEY_LEFTALT, KEY_RIGHTALT}):
-                    tty = foreground_text_vt()
-                    if tty:
-                        toggle(tty)
+                try:
+                    handle(held, fd, code, value, media_keys, last_media)
+                except Exception:   # one failed action must not end the daemon
+                    traceback.print_exc()
+
+
+def main():
+    media_keys = set(VOLUME) | set(BRIGHTNESS)
+    reserved = console_toggle_keys() & media_keys
+    if reserved:
+        print(f"left to the console keymap: keycodes {sorted(reserved)}",
+              flush=True)
+    media_keys -= reserved
+    entries = {code: K_SHIFTL for code in WIN}
+    entries.update({code: K_HOLE for code in media_keys})
+    keymap = Keymap(entries)
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+    try:
+        run(keymap, media_keys)
+    finally:
+        keymap.restore()
 
 
 if __name__ == "__main__":

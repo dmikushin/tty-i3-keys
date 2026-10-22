@@ -1,8 +1,8 @@
 [Unit]
-Description=Win+Shift+S on text consoles toggles suspend-on-lid-close
+Description=i3 hotkeys on text consoles (Win+1..0 tmux windows, Win+Shift+S lid suspend)
 
 [Service]
-ExecStart=/usr/local/bin/tty-lid-toggle-hotkey
+ExecStart=/usr/local/bin/tty-i3-keys
 Restart=always
 # The toggle script leaves a systemd-inhibit process running; it must
 # survive restarts of this daemon.
