@@ -17,7 +17,12 @@ checks:
      gets through, Ctrl+C does nothing, restarting the daemon does not
      unlock, a wrong password keeps it locked, the right one unlocks and
      returns to the VT;
-  7. the console keymap is restored when the daemon stops.
+  7. Win+K locks the keyboard: keys are dropped, a touchpad is inhibited, a
+     lone volume key still changes the volume, both volume keys together
+     unlock without changing it; a daemon killed while locked leaves no
+     inhibited touchpad behind once restarted (where the volume keys belong
+     to the console keymap, Win+K refuses);
+  8. the console keymap is restored when the daemon stops.
 Then switches back to the original VT and restarts the installed service.
 """
 import fcntl
@@ -43,11 +48,12 @@ KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_CAPSLOCK, KEY_LEFTMETA = 29, 42, 58, 125
 KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
 KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
 KEY_ESC, KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1 = 1, 28, 46, 56, 59
+KEY_K = 37
 DIGIT_KEYS = {str(d % 10): 1 + d for d in range(1, 11)}    # KEY_1 = 2 .. KEY_0 = 11
 KEYS = (KEY_1, KEY_2, KEY_3, KEY_A, KEY_Q, KEY_S, KEY_LEFTCTRL,
         KEY_LEFTSHIFT, KEY_CAPSLOCK, KEY_LEFTMETA, KEY_MUTE, KEY_VOLUMEDOWN,
         KEY_VOLUMEUP, KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP, KEY_ESC,
-        KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1, *DIGIT_KEYS.values())
+        KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1, KEY_K, *DIGIT_KEYS.values())
 LOCK_USER = "ttyi3keyslocktest"
 LOCK_PASSWORD = "73914286"   # digits: the same in the Latin and Cyrillic layouts
 UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
@@ -355,6 +361,97 @@ def lock_test(kb, restart_daemon):
     return failures
 
 
+def touchpad():
+    """A virtual touchpad (absolute X/Y, finger tool, INPUT_PROP_POINTER):
+    the kind of device the keyboard lock inhibits. Returns (fd, sysfs dir)."""
+    fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+    for ev in (EV_KEY, 3):                          # EV_ABS
+        fcntl.ioctl(fd, UI_SET_EVBIT, ev)
+    for k in (0x110, 0x145, 0x14A):                 # BTN_LEFT, TOOL_FINGER, TOUCH
+        fcntl.ioctl(fd, UI_SET_KEYBIT, k)
+    fcntl.ioctl(fd, 0x4004556E, 0)                  # UI_SET_PROPBIT POINTER
+    for axis in (0, 1):
+        fcntl.ioctl(fd, 0x40045567, axis)           # UI_SET_ABSBIT
+        fcntl.ioctl(fd, 0x401C5504, struct.pack("HH6i", axis, 0, 0, 0, 1000,
+                                                0, 0, 10))  # UI_ABS_SETUP
+    name = b"tty-i3-keys test touchpad"
+    fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack("4H80sI", 3, 1, 1, 1, name, 0))
+    fcntl.ioctl(fd, UI_DEV_CREATE)
+    time.sleep(0.3)
+    for dev in glob.glob("/sys/class/input/input*"):
+        if open(f"{dev}/name").read().strip() == name.decode():
+            return fd, dev
+    raise RuntimeError("virtual touchpad not found in sysfs")
+
+
+def kbdlock_test(kb, reserved, crash_restart):
+    """Win+K, the volume chord, and a daemon killed while locked."""
+    possible = not ({KEY_VOLUMEUP, KEY_VOLUMEDOWN} & reserved)
+    tp, tp_dev = touchpad()
+    inhibited = lambda: open(f"{tp_dev}/inhibited").read().strip()
+    vol = lambda: as_user("pamixer", "--get-volume")
+    st = {}
+
+    def volume_chord():
+        emit(kb, KEY_VOLUMEDOWN, 1)
+        emit(kb, KEY_VOLUMEUP, 1)
+        emit(kb, KEY_VOLUMEUP, 0)
+        emit(kb, KEY_VOLUMEDOWN, 0)
+        time.sleep(0.5)
+
+    def actions():
+        os.chown(TTY, USER.pw_uid, -1)
+        time.sleep(3.0)                     # earlier notifications expired
+        chord(kb, KEY_A)                    # typed
+        chord(kb, KEY_LEFTMETA, KEY_K)
+        time.sleep(0.5)
+        st["locked"] = (inhibited(), bottom_row("u").strip())
+        chord(kb, KEY_Q)                    # dropped when locked
+        if possible:
+            as_user("pamixer", "--set-volume", "50")
+            chord(kb, KEY_VOLUMEUP)         # lone: one step, after the wait
+            time.sleep(0.5)
+            st["lone"] = vol()
+            chord(kb, KEY_LEFTMETA, KEY_K)  # does not unlock
+            volume_chord()                  # unlocks
+            st["unlocked"] = (inhibited(), vol(), bottom_row("u").strip())
+        chord(kb, KEY_S)                    # typed
+        if possible:
+            volume_chord()                  # locks again
+            st["relocked"] = inhibited()
+            crash_restart()                 # SIGKILL while locked, restart
+            time.sleep(1.5)
+            st["after_crash"] = inhibited()
+            chord(kb, KEY_C)                # typed: the grab died with it
+
+    try:
+        got = run_reader(16.0 if possible else 6.0, actions)
+    finally:
+        fcntl.ioctl(tp, UI_DEV_DESTROY)
+    failures = 0
+    if not possible:
+        failures += check("Win+K refused: the volume keys are the console's",
+                          f"{got!r} {st['locked'][0]} "
+                          f"{'needs both volume' in st['locked'][1]}".encode(),
+                          b"b'aqs' 0 True")
+        return failures
+    failures += check("Win+K: touchpad inhibited, bar says locked",
+                      f"{st['locked'][0]} "
+                      f"{st['locked'][1].startswith('Keyboard locked')}".encode(),
+                      b"1 True")
+    failures += check("locked: keys dropped, the lone volume key works",
+                      st["lone"].encode(), b"53")
+    failures += check("Win+K does not unlock; the volume chord does, "
+                      "without changing the volume",
+                      f"{st['unlocked'][0]} {st['unlocked'][1]} "
+                      f"{st['unlocked'][2].startswith('Keyboard unlocked')}"
+                      .encode(), b"0 53 True")
+    failures += check("typed only while unlocked", got, b"asc")
+    failures += check("killed while locked: touchpad back after restart",
+                      f"{st['relocked']} {st['after_crash']}".encode(), b"1 0")
+    return failures
+
+
 DICTATED = "Отлично, давай оставим пока так"
 TYPE_CLIENT = r"""
 import socket, sys
@@ -453,6 +550,12 @@ def main():
     def restart_daemon():
         nonlocal daemon
         daemon.terminate()
+        daemon.wait()
+        daemon = subprocess.Popen([sys.executable, DAEMON])
+
+    def crash_restart():
+        nonlocal daemon
+        daemon.kill()
         daemon.wait()
         daemon = subprocess.Popen([sys.executable, DAEMON])
     tmux = ["tmux", "-L", "tty-i3-keys-test"]
@@ -577,6 +680,7 @@ def main():
                           str(feedback.restored).encode(), b"True")
 
         failures += typing_test()
+        failures += kbdlock_test(kb, reserved, crash_restart)
 
         # A user's tmux on the VT.
         conf = tempfile.mktemp()

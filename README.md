@@ -13,6 +13,7 @@ foreground VT is in text mode (not X), acts for the user who owns that VT:
 | brightness up / down | `brightnessctl set +5%` / `5%-` as in the i3 config (never down to 0) |
 | `Win+Escape` | lock all consoles, the counterpart of i3's `xsecurelock`: asks for the VT owner's password |
 | `Win+O` | rotate the console a quarter turn clockwise (fbcon `rotate_all`), for convertible laptops; kept across reboots in `/var/lib/tty-i3-keys/rotation` |
+| `Win+K`, or both volume buttons together | lock the keyboard (book-reader mode on a convertible folded into a tablet); only both volume buttons together unlock - see below |
 
 Feedback appears in the same bar for 2.5 seconds, with the message at the
 left and the status at the right: the lid state, the volume and brightness
@@ -132,3 +133,28 @@ The real keyboards are grabbed while it runs (virtual uinput devices are
 left alone), so typing does not disturb it. It refuses to start while the
 console is locked or another VT test runs; run it under
 `flock /tmp/vt12-test.lock` when other VT tests may run.
+
+## Keyboard lock
+
+For a convertible folded into a tablet (yoga3: no tablet-mode switch is
+reported, and a folded keyboard sends stray presses), `Win+K` or both volume
+buttons pressed together lock the keyboard:
+
+- every keyboard the daemon reads is grabbed (`EVIOCGRAB`): the console, X
+  and every other reader get no keys, and neither do the daemon's hotkeys or
+  the Win-held bar;
+- mice, TrackPoints and touchpads are inhibited through sysfs `inhibited`;
+  touchscreens (`INPUT_PROP_DIRECT`) stay, so console-mouse keeps working;
+- the volume buttons keep changing the volume (also under X, which gets no
+  keys while locked); a press waits 150 ms for its pair, so the unlock chord
+  does not move the volume;
+- only both volume buttons together unlock: `Win+K` does not, since a folded
+  keyboard can press it.
+
+Where the volume buttons are not the daemon's (the console keymap toggle file
+maps them, as on the 3a5000), it refuses to lock, so there is always a way
+out. The grabs end with the daemon process; the inhibited pointers are
+recorded in `/var/lib/tty-i3-keys/inhibited-pointers` before they are
+inhibited, put back on exit, and put back when the daemon starts after a
+crash. With the console lock (`Win+Escape`) on, the chord still unlocks the
+keyboard so the password can be typed; the volume buttons do nothing then.

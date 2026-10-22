@@ -20,7 +20,12 @@ is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
                          user's password (see Lock);
   Win+O                  rotate the console 90 degrees clockwise (fbcon
                          rotate_all: 0, 90, 180, 270), for convertible
-                         laptops; kept across reboots.
+                         laptops; kept across reboots;
+  Win+K, or both volume  lock the keyboard (see KeyboardLock), for a
+  buttons together       convertible folded into a tablet: keys reach
+                         nobody, touchpads and mice are off, the touchscreen
+                         and the volume buttons keep working. Only both
+                         volume buttons together unlock.
 
 It also types text into the console for its owner on request, through a
 socket (see TypeService): nerd-dictation's dictated text.
@@ -76,6 +81,7 @@ KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT = 29, 97, 56, 100
 KEY_S = 31
 KEY_ESC = 1
 KEY_O = 24
+KEY_K = 37
 KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
 KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
 # The commands bound to these keys in ~/.config/i3/config.
@@ -105,6 +111,10 @@ SCRIPT = ".config/i3/toggle-lid-suspend.sh"
 FBCON_ROTATE = "/sys/class/graphics/fbcon/rotate"
 FBCON_ROTATE_ALL = "/sys/class/graphics/fbcon/rotate_all"
 ROTATION_STATE = "/var/lib/tty-i3-keys/rotation"
+POINTERS_STATE = "/var/lib/tty-i3-keys/inhibited-pointers"
+EVIOCGRAB = 0x40044590
+CHORD_SECONDS = 0.15            # a volume press waits this long for its pair
+VOLUME_PAIR = {KEY_VOLUMEUP: KEY_VOLUMEDOWN, KEY_VOLUMEDOWN: KEY_VOLUMEUP}
 RESCAN_SECONDS = 5
 WIN = {KEY_LEFTMETA, KEY_RIGHTMETA}
 SHIFT = {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
@@ -233,6 +243,12 @@ def scan(open_fds, media_keys):
             fd = is_keyboard(path, media_keys)
             if fd is not None:
                 open_fds[fd] = path
+
+
+def foreground_vt():
+    """/dev/ttyN of the foreground VT, text or graphics."""
+    with open("/sys/class/tty/tty0/active") as f:
+        return "/dev/" + f.read().strip()
 
 
 def foreground_text_vt():
@@ -408,6 +424,237 @@ def rotate(bar):
         bar.notify(f"Rotation: {e}", ERROR)
         return
     bar.notify(f"Rotation: {quarter * 90} degrees", INFO)
+
+
+def sysfs_bits(path):
+    """A capability bitmap from sysfs (hex words, most significant first)."""
+    try:
+        with open(path) as f:
+            words = f.read().split()
+    except OSError:
+        return 0
+    value = 0
+    for word in words:
+        value = (value << 64) | int(word, 16)
+    return value
+
+
+def pointer_devices():
+    """sysfs dirs of mice, TrackPoints and touchpads: relative X/Y with a
+    left button, or absolute X/Y with a finger tool and INPUT_PROP_POINTER.
+    Touchscreens (INPUT_PROP_DIRECT) are not among them."""
+    found = []
+    for dev in sorted(glob.glob("/sys/class/input/input*")):
+        props = sysfs_bits(f"{dev}/properties")
+        if props >> 1 & 1:                      # INPUT_PROP_DIRECT
+            continue
+        rel = sysfs_bits(f"{dev}/capabilities/rel")
+        abs_ = sysfs_bits(f"{dev}/capabilities/abs")
+        key = sysfs_bits(f"{dev}/capabilities/key")
+        if ((rel & 3 == 3 and key >> 0x110 & 1)
+                or (abs_ & 3 == 3 and key >> 0x145 & 1 and props & 1)):
+            found.append(dev)
+    return found
+
+
+def set_inhibited(dev, value):
+    with open(f"{dev}/inhibited", "w") as f:
+        f.write(value)
+
+
+class KeyboardLock:
+    """Lock the keyboard for a convertible folded into a tablet, where the
+    keys face the table: every keyboard this daemon reads is grabbed
+    (EVIOCGRAB), so the console, X and every other reader get nothing, and
+    mice, TrackPoints and touchpads are inhibited in sysfs. The touchscreen
+    stays. The daemon keeps reading the grabbed keyboards: the volume
+    buttons still change the volume, and pressing both of them together is
+    the only way to unlock - a folded keyboard can press anything else.
+
+    It needs both volume buttons: without them (or where the console keymap
+    owns them) it refuses to lock, so there is always a way out. The grabs
+    live with this process; the inhibited pointers are recorded in
+    POINTERS_STATE before they are inhibited and put back on exit and, after
+    a crash, when the daemon starts again.
+
+    With the console screen lock (vlock) on, the chord still unlocks the
+    keyboard, so the password can be typed; other keys stay dropped."""
+
+    def __init__(self, media_keys):
+        self.possible = set(VOLUME_PAIR) <= media_keys
+        self.locked = False
+        self.grabbed = set()
+        self.pending = None     # (code, deadline): a volume press
+        self.chord = set()      # volume keys used up by a chord until released
+        self.release_pointers()
+
+    # Grabs and pointers.
+
+    def grab(self, fds):
+        for fd in fds:
+            if fd not in self.grabbed:
+                try:
+                    fcntl.ioctl(fd, EVIOCGRAB, 1)
+                    self.grabbed.add(fd)
+                except OSError:
+                    traceback.print_exc()
+
+    def forget(self, fd, fds, bar):
+        """A keyboard went away: its grab went with it, and so did whatever
+        it held. If no keyboard with both volume buttons is left, nothing
+        could unlock any more: unlock now."""
+        self.grabbed.discard(fd)
+        self.chord.clear()
+        self.pending = None
+        if self.locked and not self.unlockable(fds):
+            self.unlock(fds, bar)
+
+    @staticmethod
+    def unlockable(fds):
+        """Does one of the keyboards in `fds` have both volume buttons?"""
+        for fd in fds:
+            bits = bytearray(96)
+            try:
+                fcntl.ioctl(fd, EVIOCGBIT_EV_KEY, bits)
+            except OSError:
+                continue
+            if all(bits[c // 8] >> (c % 8) & 1 for c in VOLUME_PAIR):
+                return True
+        return False
+
+    def write_state(self, entries):
+        if not entries:
+            try:
+                os.unlink(POINTERS_STATE)
+            except FileNotFoundError:
+                pass
+            return
+        os.makedirs(os.path.dirname(POINTERS_STATE), exist_ok=True)
+        with open(POINTERS_STATE + ".new", "w") as f:
+            f.write("".join(f"{dev}\t{name}\n" for dev, name in entries))
+        os.replace(POINTERS_STATE + ".new", POINTERS_STATE)
+
+    def release_pointers(self):
+        """Un-inhibit what POINTERS_STATE says this daemon inhibited. A
+        device is matched by its sysfs path and name (the number of a gone
+        device can be reused); one that fails to come back stays recorded,
+        for the next attempt."""
+        try:
+            with open(POINTERS_STATE) as f:
+                entries = [tuple(line.rstrip("\n").split("\t", 1))
+                           for line in f if "\t" in line]
+        except FileNotFoundError:
+            return
+        failed = []
+        for dev, name in entries:
+            # Only real input devices: the file is root's, but be strict.
+            if not re.fullmatch(r"/sys/class/input/input\d+", dev):
+                continue
+            try:
+                with open(f"{dev}/name") as f:
+                    if f.read().strip() != name:
+                        continue    # gone, the number taken by another
+                set_inhibited(dev, "0")
+            except FileNotFoundError:
+                continue            # unplugged: nothing left to restore
+            except OSError:
+                traceback.print_exc()
+                failed.append((dev, name))
+        self.write_state(failed)
+
+    def inhibit_pointers(self):
+        entries = []
+        for dev in pointer_devices():
+            try:
+                with open(f"{dev}/inhibited") as f:
+                    if f.read().strip() != "0":
+                        continue
+                with open(f"{dev}/name") as f:
+                    entries.append((dev, f.read().strip()))
+            except OSError:
+                pass
+        # Recorded before they are inhibited: a crash in between is undone.
+        self.write_state(entries)
+        for dev, _ in entries:
+            try:
+                set_inhibited(dev, "1")
+            except OSError:
+                traceback.print_exc()
+
+    # Locking.
+
+    def lock(self, fds, bar):
+        if self.locked:
+            return
+        if not self.possible or not self.unlockable(fds):
+            bar.notify("Keyboard lock needs both volume buttons", WARNING)
+            return
+        self.locked = True
+        self.grab(fds)
+        self.inhibit_pointers()
+        bar.notify("Keyboard locked: press both volume buttons to unlock")
+
+    def unlock(self, fds, bar):
+        if not self.locked:
+            return
+        self.locked = False
+        for fd in list(self.grabbed):
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 0)
+            except OSError:
+                pass
+        self.grabbed.clear()
+        self.release_pointers()
+        bar.notify("Keyboard unlocked")
+
+    def stop(self):
+        """On exit: the grabs end with the process; the pointers do not."""
+        self.release_pointers()
+
+    # The volume buttons: a press waits CHORD_SECONDS for its pair.
+
+    def volume_key(self, code, value, held, fds, bar, act):
+        """Handle KEY_VOLUMEUP/DOWN; `act(code)` changes the volume.
+        Returns nothing: the press is acted on now, later (tick), or is part
+        of the lock/unlock chord."""
+        if value == 0:
+            self.chord.discard(code)
+            if self.pending and self.pending[0] == code:
+                self.flush(act)         # a short tap: act on it now
+            return
+        if code in self.chord:
+            return                      # repeats of a chord key
+        if (value == 1 and VOLUME_PAIR[code] in held and self.pending
+                and self.pending[0] == VOLUME_PAIR[code]):
+            # The pair within CHORD_SECONDS: the chord. The first press,
+            # still waiting, is cancelled, so the volume does not move. A
+            # button held longer has acted already: then this is no chord.
+            self.pending = None
+            self.chord |= {code, VOLUME_PAIR[code]}
+            (self.unlock if self.locked else self.lock)(fds, bar)
+            return
+        if value == 1:
+            self.flush(act)
+            self.pending = (code, time.monotonic() + CHORD_SECONDS)
+            return
+        # Auto-repeat: the first press is no longer waiting for a pair.
+        self.flush(act)
+        act(code)
+
+    def flush(self, act):
+        if self.pending:
+            code = self.pending[0]
+            self.pending = None
+            act(code)
+
+    def timeout(self):
+        if not self.pending:
+            return None
+        return max(0.0, self.pending[1] - time.monotonic())
+
+    def tick(self, act):
+        if self.pending and time.monotonic() >= self.pending[1]:
+            self.flush(act)
 
 
 # --- The bar: status while Win is held, and notifications ----------------
@@ -1235,19 +1482,21 @@ class TypeService:
             pass
 
 
-def handle(held, device, code, value, media_keys, last_media, bar, lock):
+def handle(held, device, code, value, media_keys, last_media, bar, lock, kbd,
+           fds, act):
     """One key event from any keyboard."""
     if value == 0:
+        owner = last_media.get(code, (0.0, None))[1]
+        if code in media_keys and owner not in (None, device):
+            return      # the release of a press the duplicate filter dropped
         held.discard(code)
+        if code in VOLUME_PAIR and kbd.possible:
+            kbd.volume_key(code, 0, held, fds, bar, act)
         if code in WIN and not held & WIN:
             bar.win_up()
         return
     first_win = code in WIN and value == 1 and not held & WIN
     held.add(code)
-    if lock.active():
-        return      # locked: no bar, no actions on the user's behalf
-    if first_win:
-        bar.win_down()
     if code in media_keys:
         # One press can arrive from two devices: the first device to report
         # it owns the press, and only its repeats (value 2, which keep
@@ -1260,13 +1509,24 @@ def handle(held, device, code, value, media_keys, last_media, bar, lock):
             last_media[code] = (now, device)
         elif owner != device:
             return
-        tty = foreground_text_vt()
-        if tty:
-            (volume if code in VOLUME else brightness)(tty, code, bar)
+        if code in VOLUME_PAIR and kbd.possible:
+            # Also the keyboard lock's chord, so before anything is dropped.
+            kbd.volume_key(code, value, held, fds, bar, act)
+            return
+    if kbd.locked:
+        return      # the keyboard is locked: every other key is dropped
+    if lock.active():
+        return      # locked: no bar, no actions on the user's behalf
+    if first_win:
+        bar.win_down()
+    if code in media_keys:
+        act(code)
         return
     if value != 1 or not held & WIN or held & CTRL_ALT:
         return
-    if code == KEY_ESC and not held & SHIFT:
+    if code == KEY_K and not held & SHIFT:
+        kbd.lock(fds, bar)
+    elif code == KEY_ESC and not held & SHIFT:
         tty = foreground_text_vt()
         if tty:
             lock.lock(tty, bar)
@@ -1283,15 +1543,35 @@ def handle(held, device, code, value, media_keys, last_media, bar, lock):
             select_window(tty, WINDOW_KEYS[code], bar)
 
 
-def run(keymap, media_keys, bar, lock, typer):
+def media_action(kbd, lock, bar):
+    """The volume/brightness action for a media key. Under X the window
+    manager has the keys - unless the keyboard is locked (grabbed), when X
+    gets nothing and the daemon acts for the owner of the VT in front. Not
+    while the console lock is on."""
+    def act(code):
+        if lock.active():
+            return
+        tty = foreground_text_vt()
+        if tty is None:
+            if not kbd.locked:
+                return
+            tty = foreground_vt()
+        (volume if code in VOLUME else brightness)(tty, code, bar)
+    return act
+
+
+def run(keymap, media_keys, bar, lock, typer, kbd):
     fds = {}
     held = set()
     last_media = {}
+    act = media_action(kbd, lock, bar)
     next_scan = 0.0
     while True:
         if time.monotonic() >= next_scan:
             try:
                 scan(fds, media_keys)
+                if kbd.locked:
+                    kbd.grab(fds)       # keyboards plugged in while locked
                 keymap.apply()
                 lock.enforce()
                 # Keep the bar's content ready for the user in front.
@@ -1300,11 +1580,14 @@ def run(keymap, media_keys, bar, lock, typer):
                     bar.blocks_for(os.stat(tty).st_uid)
             except Exception:   # retried at the next scan
                 traceback.print_exc()
-            next_scan = time.monotonic() + RESCAN_SECONDS
+            # Locked: a keyboard plugged in is grabbed within a second.
+            next_scan = time.monotonic() + (1 if kbd.locked else RESCAN_SECONDS)
         status = bar.fds()
         wait = RESCAN_SECONDS
         if bar.timeout() is not None:
             wait = min(wait, bar.timeout())
+        if kbd.timeout() is not None:
+            wait = min(wait, kbd.timeout())
         if bar.shown:
             wait = min(wait, FOLLOW_SECONDS)
         watched = list(fds) + list(status)
@@ -1313,6 +1596,7 @@ def run(keymap, media_keys, bar, lock, typer):
         watched.append(typer.fileno())
         ready, _, _ = select.select(watched, [], [], wait)
         try:
+            kbd.tick(act)
             bar.tick()
             bar.follow()
         except Exception:
@@ -1344,8 +1628,9 @@ def run(keymap, media_keys, bar, lock, typer):
             except OSError:
                 data = b""
             if not data:  # device unplugged: forget what it held down
-                os.close(fd)
                 del fds[fd]
+                kbd.forget(fd, fds, bar)
+                os.close(fd)
                 if held & WIN:
                     bar.win_up()
                 held.clear()
@@ -1356,7 +1641,7 @@ def run(keymap, media_keys, bar, lock, typer):
                     continue
                 try:
                     handle(held, fd, code, value, media_keys, last_media, bar,
-                           lock)
+                           lock, kbd, fds, act)
                 except Exception:   # one failed action must not end the daemon
                     traceback.print_exc()
 
@@ -1375,11 +1660,13 @@ def main():
     bar = Bar()
     lock = Lock()
     typer = TypeService(lock)
+    kbd = KeyboardLock(media_keys)
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     try:
-        run(keymap, media_keys, bar, lock, typer)
+        run(keymap, media_keys, bar, lock, typer, kbd)
     finally:
         try:
+            kbd.stop()
             typer.stop()
             bar.stop()
         finally:
