@@ -12,6 +12,7 @@ foreground VT is in text mode (not X), acts for the user who owns that VT:
 | volume up / down, mute | `pamixer -ui 3`, `pamixer -ud 3`, `pamixer -t` as in the i3 config, in the user's PipeWire session |
 | brightness up / down | `brightnessctl set +5%` / `5%-` as in the i3 config (never down to 0) |
 | `Win+Escape` | lock all consoles, the counterpart of i3's `xsecurelock`: asks for the VT owner's password |
+| `Win+O` | rotate the console a quarter turn clockwise (fbcon `rotate_all`), for convertible laptops; kept across reboots in `/var/lib/tty-i3-keys/rotation` |
 
 Feedback appears in the same bar for 2.5 seconds, with the message at the
 left and the status at the right: the lid state, the volume and brightness

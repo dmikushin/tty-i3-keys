@@ -17,7 +17,10 @@ is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
   Win held               the i3 bar (i3's "mode hide" bar, "modifier Mod4");
   Win+Escape             lock all consoles, like i3's xsecurelock: vlock -a
                          on a spare VT, as the VT's owner, asking for that
-                         user's password (see Lock).
+                         user's password (see Lock);
+  Win+O                  rotate the console 90 degrees clockwise (fbcon
+                         rotate_all: 0, 90, 180, 270), for convertible
+                         laptops; kept across reboots.
 
 It also types text into the console for its owner on request, through a
 socket (see TypeService): nerd-dictation's dictated text.
@@ -72,6 +75,7 @@ KEY_LEFTMETA, KEY_RIGHTMETA = 125, 126
 KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT = 29, 97, 56, 100
 KEY_S = 31
 KEY_ESC = 1
+KEY_O = 24
 KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
 KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
 # The commands bound to these keys in ~/.config/i3/config.
@@ -98,6 +102,9 @@ K_SHIFTL = 0x0704               # K(KT_SHIFT, KG_SHIFTL)
 KG_SHIFTL_BIT = 1 << 4
 NR_KEYMAPS = 256
 SCRIPT = ".config/i3/toggle-lid-suspend.sh"
+FBCON_ROTATE = "/sys/class/graphics/fbcon/rotate"
+FBCON_ROTATE_ALL = "/sys/class/graphics/fbcon/rotate_all"
+ROTATION_STATE = "/var/lib/tty-i3-keys/rotation"
 RESCAN_SECONDS = 5
 WIN = {KEY_LEFTMETA, KEY_RIGHTMETA}
 SHIFT = {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
@@ -365,6 +372,42 @@ def brightness(tty, code, bar):
         return
     info = run(["brightnessctl", "-m"]).stdout.split(",")
     bar.notify(f"Brightness: {info[3] if len(info) > 3 else '?'}", INFO)
+
+
+def set_rotation(quarter):
+    """Rotate every console by `quarter` * 90 degrees clockwise and keep it
+    for the next boot."""
+    with open(FBCON_ROTATE_ALL, "w") as f:
+        f.write(str(quarter))
+    os.makedirs(os.path.dirname(ROTATION_STATE), exist_ok=True)
+    with open(ROTATION_STATE + ".new", "w") as f:
+        f.write(f"{quarter}\n")
+    os.replace(ROTATION_STATE + ".new", ROTATION_STATE)
+
+
+def restore_rotation():
+    """At start: the rotation chosen last time, if any."""
+    try:
+        with open(ROTATION_STATE) as f:
+            quarter = int(f.read().strip()) % 4
+        if os.path.exists(FBCON_ROTATE_ALL):
+            set_rotation(quarter)
+    except (OSError, ValueError):
+        pass
+
+
+def rotate(bar):
+    """Win+O: the next quarter turn clockwise."""
+    try:
+        with open(FBCON_ROTATE) as f:
+            quarter = (int(f.read().strip()) + 1) % 4
+        # The bar row belongs to the old geometry: put it back first.
+        bar.hide()
+        set_rotation(quarter)
+    except (OSError, ValueError) as e:
+        bar.notify(f"Rotation: {e}", ERROR)
+        return
+    bar.notify(f"Rotation: {quarter * 90} degrees", INFO)
 
 
 # --- The bar: status while Win is held, and notifications ----------------
@@ -1231,6 +1274,9 @@ def handle(held, device, code, value, media_keys, last_media, bar, lock):
         tty = foreground_text_vt()
         if tty:
             toggle(tty, bar)
+    elif code == KEY_O and not held & SHIFT:
+        if foreground_text_vt():
+            rotate(bar)
     elif code in WINDOW_KEYS and not held & SHIFT:
         tty = foreground_text_vt()
         if tty:
@@ -1325,6 +1371,7 @@ def main():
     entries = {code: K_SHIFTL for code in WIN}
     entries.update({code: K_HOLE for code in media_keys})
     keymap = Keymap(entries)
+    restore_rotation()
     bar = Bar()
     lock = Lock()
     typer = TypeService(lock)
