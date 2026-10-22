@@ -89,6 +89,13 @@ def grab_keyboards():
     for path in glob.glob("/dev/input/event*"):
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            # Virtual devices (uinput: another test's keyboard, or ours) are
+            # not the person at the machine: leave them alone.
+            bustype = struct.unpack("4H", fcntl.ioctl(fd, 0x80084502,
+                                                      bytes(8)))[0]
+            if bustype == 0x06:                     # EVIOCGID, BUS_VIRTUAL
+                os.close(fd)
+                continue
             bits = bytearray(96)
             fcntl.ioctl(fd, 0x80604521, bits)       # EVIOCGBIT(EV_KEY, 96)
             if bits[KEY_A // 8] >> (KEY_A % 8) & 1:
@@ -348,7 +355,83 @@ def lock_test(kb, restart_daemon):
     return failures
 
 
+DICTATED = "Отлично, давай оставим пока так"
+TYPE_CLIENT = r"""
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/run/tty-i3-keys-type.sock")
+s.sendall(sys.argv[1].encode())
+s.shutdown(socket.SHUT_WR)
+print(s.recv(4096).decode().strip())
+"""
+
+
+def type_request(uid, text):
+    """Ask the daemon's typing socket, as `uid`; return its reply."""
+    user = pwd.getpwuid(uid)
+    return subprocess.run(
+        [sys.executable, "-c", TYPE_CLIENT, text], user=uid, group=user.pw_gid,
+        env={"PATH": "/usr/bin"}, capture_output=True, text=True,
+        timeout=10).stdout.strip()
+
+
+def typing_test():
+    """The typing socket (nerd-dictation's text on the console): the VT's
+    owner gets the text typed, exactly; another user is refused; with the VT
+    in graphics mode (X) the answer is "x". If NERD_DICTATION_DRIVER names a
+    built tests/console_type_driver of nerd-dictation, its "auto" input
+    method is checked the same way, as the VT's owner."""
+    failures = 0
+    nobody = pwd.getpwnam("nobody").pw_uid
+    replies = {}
+    driver = os.environ.get("NERD_DICTATION_DRIVER")
+
+    def actions():
+        os.chown(TTY, USER.pw_uid, -1)
+        replies["owner"] = type_request(USER.pw_uid, DICTATED)
+        replies["other"] = type_request(nobody, "intruder")
+        fd = os.open(TTY, os.O_RDONLY | os.O_NOCTTY)
+        try:
+            fcntl.ioctl(fd, 0x4B3A, 1)          # KDSETMODE KD_GRAPHICS
+            replies["graphics"] = type_request(USER.pw_uid, "nothing")
+        finally:
+            fcntl.ioctl(fd, 0x4B3A, 0)          # KD_TEXT
+            os.close(fd)
+        if driver:
+            subprocess.run([driver, "type", " " + DICTATED],
+                           user=USER.pw_uid, group=USER.pw_gid,
+                           env={"PATH": "/usr/bin"}, timeout=10)
+            subprocess.run([driver, "key", "ctrl+Return"],
+                           user=USER.pw_uid, group=USER.pw_gid,
+                           env={"PATH": "/usr/bin"}, timeout=10)
+
+    got = run_reader(4.0, actions)
+    expected = DICTATED.encode()
+    if driver:
+        expected += (" " + DICTATED).encode() + b"\r"
+    failures += check("typing socket: the owner's text arrives exactly"
+                      + (", also via nerd-dictation 'auto'" if driver else ""),
+                      got, expected)
+    failures += check("typing socket: replies owner/other/graphics",
+                      f"{replies.get('owner')}|{replies.get('other')}|"
+                      f"{replies.get('graphics')}".encode(),
+                      b"ok|denied: the console in front is not yours|x")
+    return failures
+
+
 def main():
+    # A console lock blocks every VT switch: the test would hang on chvt.
+    if os.path.exists("/run/tty-i3-keys/lock.json"):
+        sys.exit("the console is locked (Win+Escape): unlock it first")
+    others = subprocess.run(["pgrep", "-f", "tests/vt-test"],
+                            capture_output=True, text=True).stdout.split()
+    ours, pid = set(), os.getpid()      # this test and its sudo/flock/make
+    while pid > 1:
+        ours.add(pid)
+        with open(f"/proc/{pid}/stat") as f:
+            pid = int(f.read().rsplit(")", 1)[1].split()[1])
+    if any(int(p) not in ours for p in others):
+        sys.exit("another VT test is running: it would fight over the VTs")
     failures = render_test()
     original_vt = open("/sys/class/tty/tty0/active").read().strip()[3:]
     active = [s for s in SERVICES if subprocess.run(
@@ -492,6 +575,8 @@ def main():
                                for t in texts]).encode(), b"[True, True]")
         failures += check("row restored byte-exact after the message",
                           str(feedback.restored).encode(), b"True")
+
+        failures += typing_test()
 
         # A user's tmux on the VT.
         conf = tempfile.mktemp()

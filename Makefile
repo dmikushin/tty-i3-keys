@@ -20,6 +20,6 @@ uninstall:
 	systemctl daemon-reload
 
 test:
-	python3 tests/vt-test.py
+	flock /tmp/vt12-test.lock python3 tests/vt-test.py
 
 .PHONY: install uninstall test

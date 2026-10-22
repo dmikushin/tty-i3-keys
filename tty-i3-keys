@@ -19,6 +19,9 @@ is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
                          on a spare VT, as the VT's owner, asking for that
                          user's password (see Lock).
 
+It also types text into the console for its owner on request, through a
+socket (see TypeService): nerd-dictation's dictated text.
+
 The bar is the bottom row of the VT, drawn into the screen memory
 (/dev/vcsaN) over whatever program is there: the user's own i3blocks runs
 persistently as that user and its i3bar JSON stream is the right part.
@@ -51,11 +54,13 @@ import pwd
 import re
 import select
 import signal
+import socket
 import stat
 import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 import traceback
 import unicodedata
@@ -1062,6 +1067,131 @@ class Lock:
                     print(f"lock: VT {vt} still busy, retried later", flush=True)
 
 
+# --- Typing on the console for its owner (nerd-dictation) -----------------
+
+TYPE_SOCKET = "/run/tty-i3-keys-type.sock"
+TYPE_MAX_BYTES = 64 * 1024
+TYPE_CLIENT_SECONDS = 2         # a client must have sent all its text by then
+TYPE_MAX_CLIENTS = 4
+TIOCSTI = 0x5412
+UCRED = struct.Struct("3i")     # struct ucred: pid, uid, gid
+
+
+class TypeService:
+    """Type text into the foreground text VT for the user who owns it.
+
+    A user process cannot inject input into a VT: TIOCSTI on a terminal that
+    is not its controlling one needs CAP_SYS_ADMIN (dev.tty.legacy_tiocsti
+    is 0). nerd-dictation types its text through this socket when the
+    console, not X, is in front. Protocol: connect, send the UTF-8 bytes,
+    shut down the sending side, read one reply line:
+      ok        typed (an empty request only asks, and types nothing);
+      x         the VT in front is in graphics mode: X takes the text;
+      denied: <reason>   not typed.
+    Who may type is decided by the peer's uid (SO_PEERCRED), not by the
+    socket's mode: only into a VT that this uid owns, never a root-owned
+    (login) VT, never while the console lock is on. The VT in front is
+    checked again while typing, so a switch mid-text stops it."""
+
+    def __init__(self, lock):
+        self.lock = lock
+        self.slots = threading.BoundedSemaphore(TYPE_MAX_CLIENTS)
+        try:
+            os.unlink(TYPE_SOCKET)
+        except FileNotFoundError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(TYPE_SOCKET)
+        os.chmod(TYPE_SOCKET, 0o666)
+        self.sock.listen(TYPE_MAX_CLIENTS)
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def accept(self):
+        conn, _ = self.sock.accept()
+        if not self.slots.acquire(blocking=False):
+            self.reply(conn, "denied: busy")
+            conn.close()
+            return
+        threading.Thread(target=self.serve, args=(conn,), daemon=True).start()
+
+    @staticmethod
+    def reply(conn, text):
+        try:
+            conn.sendall(text.encode() + b"\n")
+        except OSError:
+            pass
+
+    def serve(self, conn):
+        try:
+            uid = UCRED.unpack(conn.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, UCRED.size))[1]
+            # One deadline for the whole request, not per recv: a client
+            # trickling bytes must not hold a slot for ever.
+            deadline = time.monotonic() + TYPE_CLIENT_SECONDS
+            data = b""
+            try:
+                while len(data) <= TYPE_MAX_BYTES:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise socket.timeout
+                    conn.settimeout(left)
+                    chunk = conn.recv(TYPE_MAX_BYTES + 1 - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+            except socket.timeout:
+                self.reply(conn, "denied: the text did not arrive in time")
+                return
+            if len(data) > TYPE_MAX_BYTES:
+                self.reply(conn, f"denied: more than {TYPE_MAX_BYTES} bytes")
+                return
+            self.reply(conn, self.type(uid, data))
+        except Exception:
+            traceback.print_exc()
+        finally:
+            conn.close()
+            self.slots.release()
+
+    def type(self, uid, data):
+        with open("/sys/class/tty/tty0/active") as f:
+            tty = "/dev/" + f.read().strip()
+        fd = os.open(tty, os.O_RDONLY | os.O_NOCTTY)
+        try:
+            mode = bytearray(4)
+            fcntl.ioctl(fd, KDGETMODE, mode)
+            if struct.unpack("i", mode)[0] != KD_TEXT:
+                return "x"
+            owner = os.fstat(fd).st_uid
+            if self.lock.active():
+                return "denied: the console is locked"
+            if owner == 0 or owner != uid:
+                return "denied: the console in front is not yours"
+            # Every byte goes in only while the VT is still in front, still
+            # this user's and not locked: a switch, a logout or Win+Escape
+            # mid-text stops the rest. (The fd stays bound to this VT, so a
+            # switch could never send the text to another one.)
+            with open("/sys/class/tty/tty0/active") as active:
+                for byte in data:
+                    active.seek(0)
+                    if "/dev/" + active.read().strip() != tty:
+                        return "denied: the console was switched"
+                    if os.fstat(fd).st_uid != uid or self.lock.active():
+                        return "denied: the console changed hands"
+                    fcntl.ioctl(fd, TIOCSTI, bytes([byte]))
+            return "ok"
+        finally:
+            os.close(fd)
+
+    def stop(self):
+        self.sock.close()
+        try:
+            os.unlink(TYPE_SOCKET)
+        except FileNotFoundError:
+            pass
+
+
 def handle(held, device, code, value, media_keys, last_media, bar, lock):
     """One key event from any keyboard."""
     if value == 0:
@@ -1107,7 +1237,7 @@ def handle(held, device, code, value, media_keys, last_media, bar, lock):
             select_window(tty, WINDOW_KEYS[code], bar)
 
 
-def run(keymap, media_keys, bar, lock):
+def run(keymap, media_keys, bar, lock, typer):
     fds = {}
     held = set()
     last_media = {}
@@ -1134,6 +1264,7 @@ def run(keymap, media_keys, bar, lock):
         watched = list(fds) + list(status)
         if lock.fileno() is not None:
             watched.append(lock.fileno())
+        watched.append(typer.fileno())
         ready, _, _ = select.select(watched, [], [], wait)
         try:
             bar.tick()
@@ -1141,6 +1272,12 @@ def run(keymap, media_keys, bar, lock):
         except Exception:
             traceback.print_exc()
         for fd in ready:
+            if fd == typer.fileno():
+                try:
+                    typer.accept()
+                except Exception:
+                    traceback.print_exc()
+                continue
             if fd == lock.fileno():
                 try:
                     lock.ended()
@@ -1190,11 +1327,13 @@ def main():
     keymap = Keymap(entries)
     bar = Bar()
     lock = Lock()
+    typer = TypeService(lock)
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     try:
-        run(keymap, media_keys, bar, lock)
+        run(keymap, media_keys, bar, lock, typer)
     finally:
         try:
+            typer.stop()
             bar.stop()
         finally:
             keymap.restore()

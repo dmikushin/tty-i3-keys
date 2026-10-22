@@ -82,6 +82,19 @@ root can. `Ctrl+Alt+Del` still reboots through systemd (no session survives
 that). Magic SysRq is what the kernel allows; on these laptops
 `kernel.sysrq = 16`, i.e. only sync.
 
+## Typing for the console's owner
+
+A user process cannot inject input into a VT (TIOCSTI on a terminal that
+is not its controlling one needs `CAP_SYS_ADMIN`). The daemon offers it on
+`/run/tty-i3-keys-type.sock`: connect, send UTF-8 text, shut down the
+sending side, read one line: `ok` (typed; an empty request only asks), `x`
+(the VT in front is in graphics mode: X takes the text) or
+`denied: <reason>`. It types only into the foreground VT, only if the
+client's uid (`SO_PEERCRED`) owns it, never into a root-owned (login) VT
+or while the console is locked, and stops if the VT is switched or changes
+hands mid-text. [nerd-dictation](../nerd-dictation)'s `auto` input method
+types the dictated text through it.
+
 ## Install
 
 ```sh
@@ -110,5 +123,11 @@ with a throwaway user created with a known password and deleted afterwards:
 `VT_ACTIVATE` and `Ctrl+C` do not get out, restarting the daemon does not
 unlock, a wrong password keeps it locked, the right one unlocks and returns
 to the VT. Volume, brightness and the lid state are put
-back afterwards. The real keyboards are grabbed while it runs, so typing
-does not disturb it.
+back afterwards. The typing socket is tested too: the VT owner's text
+arrives byte-exact, another user is refused, a VT in graphics mode answers
+`x`; with `NERD_DICTATION_DRIVER` set to nerd-dictation's built
+`console_type_driver`, its `auto` input method is checked the same way.
+The real keyboards are grabbed while it runs (virtual uinput devices are
+left alone), so typing does not disturb it. It refuses to start while the
+console is locked or another VT test runs; run it under
+`flock /tmp/vt12-test.lock` when other VT tests may run.
