@@ -26,7 +26,10 @@ is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
   buttons together       convertible folded into a tablet: keys reach
                          nobody, touchpads and mice are off, the touchscreen
                          and the volume buttons keep working. Only both
-                         volume buttons together unlock.
+                         volume buttons together unlock;
+  Menu                   toggle the VT owner's nerd-dictation (for laptops
+                         without a middle mouse button; console-mouse's
+                         middle click does the same), its reply in the bar.
 
 It also types text into the console for its owner on request, through a
 socket (see TypeService): nerd-dictation's dictated text.
@@ -82,6 +85,7 @@ KEY_S = 31
 KEY_ESC = 1
 KEY_O = 24
 KEY_K = 37
+KEY_COMPOSE = 127               # the Menu key
 KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
 KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
 # The commands bound to these keys in ~/.config/i3/config.
@@ -431,6 +435,93 @@ def as_user(uid, argv, stderr=False):
 
 
 # --- Actions; their feedback goes to the bar (Bar.notify) ----------------
+
+DICTATION_SOCKET = "/run/user/{uid}/nerd-dictation-ex.sock"
+DICTATION_SECONDS = 12          # the client gives up on the socket after 10 s
+# Sends nerd-dictation's own "toggle" command and prints its JSON reply, or
+# "not running" when there is no daemon to talk to.
+DICTATION_CLIENT = """
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+try:
+    s.connect(sys.argv[1])
+except OSError:
+    print(json.dumps({"status": "not running"}))
+    sys.exit()
+try:
+    s.send(json.dumps({"action": "toggle"}).encode())
+    sys.stdout.write(s.recv(4096).decode(errors="replace"))
+except OSError as e:
+    print(json.dumps({"status": "error", "message": str(e)}))
+"""
+
+
+class Dictation:
+    """Toggles the nerd-dictation daemon of the user who owns the console,
+    as console-mouse's middle click does. The socket lives in a directory
+    that user controls, so the client runs as that user, never as root, and
+    only one request is in flight. Its reply goes to the bar."""
+
+    def __init__(self):
+        self.child = None
+        self.deadline = 0.0
+
+    def toggle(self, tty, bar):
+        uid = os.stat(tty).st_uid
+        if uid == 0:
+            return  # login prompt: nobody to act for
+        if self.child is not None:
+            bar.notify("Dictation: previous request still pending", WARNING)
+            return
+        user = pwd.getpwuid(uid)
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", DICTATION_CLIENT,
+             DICTATION_SOCKET.format(uid=uid)],
+            user=uid, group=user.pw_gid, extra_groups=[], env={},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        self.deadline = time.monotonic() + DICTATION_SECONDS
+
+    def fileno(self):
+        return self.child.stdout.fileno() if self.child else None
+
+    def timeout(self):
+        return max(0.0, self.deadline - time.monotonic()) if self.child else None
+
+    def tick(self, bar):
+        """Give up on a client that outlived its deadline."""
+        if self.child and time.monotonic() >= self.deadline:
+            self.finish(bar, b"")
+
+    def ready(self, bar):
+        self.finish(bar, os.read(self.child.stdout.fileno(), OUTPUT_LIMIT))
+
+    def finish(self, bar, out):
+        child, self.child = self.child, None
+        child.stdout.close()
+        try:
+            child.wait(1)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+        try:
+            reply = json.loads(out.decode(errors="replace"))
+        except ValueError:
+            reply = {"status": "error", "message": "no reply"}
+        print(f"dictation toggle: {reply}", flush=True)
+        if reply.get("status") == "ok":
+            bar.notify(f"Dictation: {reply.get('message', 'ok')}", INFO)
+        elif reply.get("status") == "not running":
+            bar.notify("Dictation: not running", WARNING)
+        else:
+            bar.notify(f"Dictation: {reply.get('message', 'error')}", WARNING)
+
+    def stop(self):
+        if self.child:
+            os.killpg(self.child.pid, signal.SIGKILL)
+            self.child.wait()
+            self.child = None
 
 def toggle(tty, bar):
     uid = os.stat(tty).st_uid
@@ -1582,7 +1673,7 @@ class TypeService:
 
 
 def handle(held, device, code, value, media_keys, last_media, bar, lock, kbd,
-           fds, act):
+           fds, act, dictation):
     """One key event from any keyboard."""
     if value == 0:
         owner = last_media.get(code, (0.0, None))[1]
@@ -1623,6 +1714,13 @@ def handle(held, device, code, value, media_keys, last_media, bar, lock, kbd,
     if code in media_keys:
         act(code)
         return
+    if code == KEY_COMPOSE:
+        # The Menu key alone (repeats ignored): the dictation toggle.
+        if value == 1 and not held & (WIN | CTRL_ALT):
+            tty = foreground_text_vt()
+            if tty:
+                dictation.toggle(tty, bar)
+        return
     if value != 1 or not held & WIN or held & CTRL_ALT:
         return
     if code == KEY_K and not held & SHIFT:
@@ -1661,7 +1759,7 @@ def media_action(kbd, lock, bar):
     return act
 
 
-def run(keymap, media_keys, bar, lock, typer, kbd):
+def run(keymap, media_keys, bar, lock, typer, kbd, dictation):
     fds = {}
     held = set()
     last_media = {}
@@ -1690,15 +1788,20 @@ def run(keymap, media_keys, bar, lock, typer, kbd):
             wait = min(wait, bar.timeout())
         if kbd.timeout() is not None:
             wait = min(wait, kbd.timeout())
+        if dictation.timeout() is not None:
+            wait = min(wait, dictation.timeout())
         if bar.shown:
             wait = min(wait, FOLLOW_SECONDS)
         watched = list(fds) + list(status)
         if lock.fileno() is not None:
             watched.append(lock.fileno())
         watched.append(typer.fileno())
+        if dictation.fileno() is not None:
+            watched.append(dictation.fileno())
         ready, _, _ = select.select(watched, [], [], wait)
         try:
             kbd.tick(act)
+            dictation.tick(bar)
             bar.tick()
             bar.follow()
         except Exception:
@@ -1713,6 +1816,12 @@ def run(keymap, media_keys, bar, lock, typer, kbd):
             if fd == lock.fileno():
                 try:
                     lock.ended()
+                except Exception:
+                    traceback.print_exc()
+                continue
+            if fd == dictation.fileno():
+                try:
+                    dictation.ready(bar)
                 except Exception:
                     traceback.print_exc()
                 continue
@@ -1745,7 +1854,7 @@ def run(keymap, media_keys, bar, lock, typer, kbd):
                     continue
                 try:
                     handle(held, fd, code, value, media_keys, last_media, bar,
-                           lock, kbd, fds, act)
+                           lock, kbd, fds, act, dictation)
                 except Exception:   # one failed action must not end the daemon
                     traceback.print_exc()
 
@@ -1759,17 +1868,23 @@ def main():
     media_keys -= reserved
     entries = {code: K_SHIFTL for code in WIN}
     entries.update({code: K_HOLE for code in media_keys})
+    # The Menu key toggles dictation: it must not also be a console key
+    # (ruwin_cplk maps it to nothing; another keymap may not).
+    if KEY_COMPOSE not in console_toggle_keys():
+        entries[KEY_COMPOSE] = K_HOLE
     keymap = Keymap(entries)
     restore_rotation()
     bar = Bar()
     lock = Lock()
     typer = TypeService(lock)
     kbd = KeyboardLock(media_keys)
+    dictation = Dictation()
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     try:
-        run(keymap, media_keys, bar, lock, typer, kbd)
+        run(keymap, media_keys, bar, lock, typer, kbd, dictation)
     finally:
         try:
+            dictation.stop()
             kbd.stop()
             typer.stop()
             bar.stop()

@@ -24,18 +24,27 @@ checks:
      unlock without changing it; a daemon killed while locked leaves no
      inhibited touchpad behind once restarted (where the volume keys belong
      to the console keymap, Win+K refuses);
-  8. the console keymap is restored when the daemon stops.
+  8. the Menu key toggles the VT owner's nerd-dictation (a fake daemon
+     socket of a throwaway uid): one {"action": "toggle"} per press,
+     repeats ignored, nothing typed, the reply shown in the bar; with no
+     daemon the bar says so; the keymap entry of the key is voided while
+     the daemon runs and comes back after a stop and after SIGKILL;
+  9. the console keymap is restored when the daemon stops.
 Then switches back to the original VT and restarts the installed service.
 """
 import fcntl
 import glob
+import json
 import os
 import pwd
 import re
+import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,13 +60,14 @@ KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
 KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
 KEY_ESC, KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1 = 1, 28, 46, 56, 59
 KEY_K = 37
+KEY_COMPOSE = 127               # the Menu key: the dictation toggle
 KEY_Z, KEY_BACKSLASH = 44, 43
 DIGIT_KEYS = {str(d % 10): 1 + d for d in range(1, 11)}    # KEY_1 = 2 .. KEY_0 = 11
 KEYS = (KEY_1, KEY_2, KEY_3, KEY_A, KEY_Q, KEY_S, KEY_LEFTCTRL,
         KEY_LEFTSHIFT, KEY_CAPSLOCK, KEY_LEFTMETA, KEY_MUTE, KEY_VOLUMEDOWN,
         KEY_VOLUMEUP, KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP, KEY_ESC,
         KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1, KEY_K, KEY_Z, KEY_BACKSLASH,
-        *DIGIT_KEYS.values())
+        KEY_COMPOSE, *DIGIT_KEYS.values())
 LOCK_USER = "ttyi3keyslocktest"
 LOCK_PASSWORD = "73914286"   # digits: the same in the Latin and Cyrillic layouts
 UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
@@ -156,7 +166,7 @@ def keymap_entries():
     fd = daemon_module().unicode_vt()
     out = []
     for table in range(256):
-        for key in (0, 125, 126, 113, 114, 115, 224, 225):
+        for key in (0, 125, 126, 113, 114, 115, 224, 225, KEY_COMPOSE):
             buf = bytearray(struct.pack("BBH", table, key, 0))
             fcntl.ioctl(fd, 0x4B46, buf)        # KDGKBENT
             out.append(struct.unpack("BBH", buf)[2])
@@ -195,8 +205,6 @@ def unicode_keymap_test():
     them on exit. A Unicode value (U+0441) is put where the daemon acts
     (Win, keycode 125, table 2) and must come back after a clean stop and
     after SIGKILL + restart + stop; the whole keymap must be unchanged."""
-    m = daemon_module()
-    fd = m.unicode_vt()
     front = open("/sys/class/tty/tty0/active").read().strip()
     tfd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
     mode = bytearray(4)
@@ -204,15 +212,25 @@ def unicode_keymap_test():
     os.close(tfd)
     print(f"  VT in front: {front}, keyboard mode {struct.unpack('i', mode)[0]}"
           f" (3 = Unicode; X is not)")
+    return owned_entry_test((2, 125), 0xf441, 0x0704,
+                            "Unicode entry kept with X in front")
+
+
+def owned_entry_test(slot, value, running, label):
+    """Put `value` at keymap `slot` (table, keycode) - a key the daemon owns
+    - and check the daemon sets it to `running` while it runs and puts
+    `value` back after a clean stop and after SIGKILL + restart + stop; the
+    whole keymap must end unchanged."""
+    m = daemon_module()
+    fd = m.unicode_vt()
     before = keymap_snapshot(fd)
-    slot, value = (2, 125), 0xf441
     original = kb_entry(fd, *slot)
     kb_entry(fd, *slot, value)
     seen = []
     try:
         d = subprocess.Popen([sys.executable, DAEMON])
         time.sleep(1.2)
-        seen.append(kb_entry(fd, *slot))        # Win: ShiftL while running
+        seen.append(kb_entry(fd, *slot))        # the daemon's value while running
         d.terminate(); d.wait()
         seen.append(kb_entry(fd, *slot))        # back after a clean stop
         d = subprocess.Popen([sys.executable, DAEMON])
@@ -226,10 +244,80 @@ def unicode_keymap_test():
         kb_entry(fd, *slot, original)
         after = keymap_snapshot(fd)
         os.close(fd)
-    failures = check("Unicode entry kept with X in front (run, stop, kill+restart)",
+    failures = check(f"{label} (run, stop, kill+restart)",
                      " ".join(f"{v:#06x}" for v in seen).encode(),
-                     b"0x0704 0xf441 0xf441")
+                     f"{running:#06x} {value:#06x} {value:#06x}".encode())
     failures += check("whole keymap unchanged", str(after == before).encode(),
+                      b"True")
+    return failures
+
+
+def dictation_test(kb):
+    """The Menu key on a VT of a throwaway uid (nobody) with a fake
+    nerd-dictation socket in its runtime directory: one toggle request per
+    press (repeats ignored), nothing typed, the reply in the bar; with the
+    socket gone the bar says the dictation is not running."""
+    nobody = pwd.getpwnam("nobody")
+    rundir = f"/run/user/{nobody.pw_uid}"
+    made_dir = not os.path.exists(rundir)
+    os.makedirs(rundir, mode=0o700, exist_ok=True)
+    os.chown(rundir, nobody.pw_uid, nobody.pw_gid)
+    path = f"{rundir}/nerd-dictation-ex.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    os.chown(path, nobody.pw_uid, nobody.pw_gid)
+    server.listen()
+    requests = []
+
+    def serve():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                requests.append(json.loads(conn.recv(4096)))
+                conn.sendall(json.dumps({"status": "ok",
+                                         "message": "started"}).encode())
+
+    threading.Thread(target=serve, daemon=True).start()
+    rows = {}
+
+    def actions():
+        os.chown(TTY, nobody.pw_uid, -1)
+        time.sleep(3.0)         # earlier notifications have expired
+        emit(kb, KEY_COMPOSE, 1)
+        for _ in range(5):
+            emit(kb, KEY_COMPOSE, 2)        # autorepeat
+        emit(kb, KEY_COMPOSE, 0)
+        time.sleep(0.8)
+        rows["reply"] = bottom_row("u").rstrip()
+        server.close()
+        os.unlink(path)
+        time.sleep(3.0)
+        chord(kb, KEY_COMPOSE)
+        time.sleep(0.8)
+        rows["missing"] = bottom_row("u").rstrip()
+        chord(kb, KEY_1)                    # the VT still types
+
+    try:
+        got = run_reader(10.0, actions)
+    finally:
+        server.close()
+        if os.path.exists(path):
+            os.unlink(path)
+        if made_dir:
+            shutil.rmtree(rundir, ignore_errors=True)
+    for r in rows.values():
+        print(f"  bar: {r!r}")
+    failures = check("Menu: one toggle request, repeats ignored",
+                     json.dumps(requests).encode(), b'[{"action": "toggle"}]')
+    failures += check("Menu types nothing", got, b"1")
+    failures += check("dictation reply shown at column 0",
+                      str(rows["reply"].startswith("Dictation: started")).encode(),
+                      b"True")
+    failures += check("no dictation daemon shown",
+                      str(rows["missing"].startswith("Dictation: not running")).encode(),
                       b"True")
     return failures
 
@@ -289,8 +377,11 @@ def bottom_row(kind):
 
 
 def backlight():
-    path = sorted(glob.glob("/sys/class/backlight/*/brightness"))[0]
-    return path, int(open(path).read())
+    """(path, level) of the first backlight, or (None, None) without one."""
+    paths = sorted(glob.glob("/sys/class/backlight/*/brightness"))
+    if not paths:
+        return None, None
+    return paths[0], int(open(paths[0]).read())
 
 
 def inhibited():
@@ -633,7 +724,7 @@ def typing_test():
 def main():
     # Optional names of the parts to run (default: all), e.g. `kbdlock`
     # on a machine whose console is in use: render typing brightness
-    # bar feedback socket kbdlock crash tmux lock unicode. Setup, teardown and
+    # bar feedback socket dictation kbdlock crash tmux lock unicode. Setup, teardown and
     # the final keymap check always run.
     parts = set(sys.argv[1:])
     want = lambda name: not parts or name in parts
@@ -661,6 +752,11 @@ def main():
     if want("unicode"):
         # Before any VT switch: with X in front, as on a laptop running i3.
         failures += unicode_keymap_test()
+    if want("dictation"):
+        # The Menu key is voided while the daemon runs, even where the
+        # keymap gives it a key (here U+0441), and given back after.
+        failures += owned_entry_test((0, KEY_COMPOSE), 0xf441, 0x0200,
+                                     "Menu key voided and restored")
     keymap_before = keymap_entries()
     reserved = toggle_keys()
     bl_path, bl_before = backlight()
@@ -718,7 +814,9 @@ def main():
             time.sleep(0.3)
             bright.up = backlight()[1]
 
-        if want("brightness"):
+        if want("brightness") and bl_path is None:
+            print("SKIP: brightness (no /sys/class/backlight device)")
+        elif want("brightness"):
             run_reader(1.5, bright)
             failures += check("brightness down then up",
                               str(bright.down < bl_before and bright.up > bright.down
@@ -811,6 +909,8 @@ def main():
 
         if want("socket"):
             failures += typing_test()
+        if want("dictation"):
+            failures += dictation_test(kb)
         if want("kbdlock"):
             failures += kbdlock_test(kb, reserved, crash_restart)
         if want("crash"):
@@ -854,8 +954,9 @@ def main():
         failures += check("keymap restored on stop",
                           str(keymap_entries() == keymap_before).encode(),
                           b"True")
-        with open(bl_path, "w") as f:
-            f.write(str(bl_before))
+        if bl_path:
+            with open(bl_path, "w") as f:
+                f.write(str(bl_before))
         if vol_before:
             as_user("pamixer", "--set-volume", vol_before)
         if mute_before and as_user("pamixer", "--get-mute") != mute_before:
