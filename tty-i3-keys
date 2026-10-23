@@ -112,6 +112,9 @@ FBCON_ROTATE = "/sys/class/graphics/fbcon/rotate"
 FBCON_ROTATE_ALL = "/sys/class/graphics/fbcon/rotate_all"
 ROTATION_STATE = "/var/lib/tty-i3-keys/rotation"
 POINTERS_STATE = "/var/lib/tty-i3-keys/inhibited-pointers"
+# The console keymap entries as they were before any instance changed them.
+# In /run: the kernel keymap does not survive a reboot either.
+KEYMAP_STATE = "/run/tty-i3-keys/keymap-original"
 EVIOCGRAB = 0x40044590
 CHORD_SECONDS = 0.15            # a volume press waits this long for its pair
 VOLUME_PAIR = {KEY_VOLUMEUP: KEY_VOLUMEDOWN, KEY_VOLUMEDOWN: KEY_VOLUMEUP}
@@ -148,7 +151,13 @@ class Keymap:
     keys it handles become holes, so they do not also type F13/F14/Help.
     Only allocated tables are touched: writing even a hole into a missing
     table allocates it. Re-applied if something reloads the keymap
-    (loadkeys, systemd-vconsole-setup); restored on exit."""
+    (loadkeys, systemd-vconsole-setup); restored on exit.
+
+    The original entries are written to KEYMAP_STATE before the first change
+    and read back by the next instance: an instance that dies without
+    restoring (SIGKILL, a crash) leaves its changes in the kernel, and the
+    next one would otherwise take them for the originals and "restore" them
+    on exit, leaving Win and the media keys dead for good."""
 
     def __init__(self, entries):
         # /dev/tty0 opens the console in front at that moment, and an open
@@ -156,8 +165,34 @@ class Keymap:
         # started on the lock's spare VT would pin that VT forever.
         self.fd = None
         self.entries = entries      # keycode -> value to set
-        self.saved = {}             # (table, keycode) -> original entry
+        self.saved = self.load()    # (table, keycode) -> original entry
         self.warned = False
+
+    @staticmethod
+    def load():
+        saved = {}
+        try:
+            with open(KEYMAP_STATE) as f:
+                for line in f:
+                    table, keycode, value = (int(x, 0) for x in line.split())
+                    saved[table, keycode] = value
+        except FileNotFoundError:
+            return saved
+        except (OSError, ValueError):
+            traceback.print_exc()
+            return saved
+        print(f"keymap: {len(saved)} original entries left by an instance "
+              "that did not restore them", flush=True)
+        return saved
+
+    def store(self):
+        os.makedirs(os.path.dirname(KEYMAP_STATE), exist_ok=True)
+        with open(KEYMAP_STATE + ".new", "w") as f:
+            f.writelines(f"{t} {k} {v:#06x}\n"
+                         for (t, k), v in sorted(self.saved.items()))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(KEYMAP_STATE + ".new", KEYMAP_STATE)
 
     def get(self, table, keycode):
         buf = bytearray(struct.pack("BBH", table, keycode, 0))
@@ -189,12 +224,24 @@ class Keymap:
                       "alone, Win+key will also type", flush=True)
                 self.warned = True
             entries = {k: v for k, v in entries.items() if v != K_SHIFTL}
+        changes = []
         for table in tables:
             for keycode, wanted in entries.items():
                 value = self.get(table, keycode)
                 if value != wanted:
-                    self.saved[table, keycode] = value
-                    self.set(table, keycode, wanted)
+                    # A value other than ours is the original (or a reloaded
+                    # keymap's, which is the one to keep).
+                    changes.append((table, keycode, value, wanted))
+        if not changes:
+            return
+        for table, keycode, value, _ in changes:
+            self.saved[table, keycode] = value
+        self.store()            # before the change: a crash leaves the record
+        for table, keycode, _, wanted in changes:
+            self.set(table, keycode, wanted)
+        print(f"keymap: set {len(changes)} entries: " + ", ".join(
+            f"t{t}/k{k} {old:#06x}->{new:#06x}" for t, k, old, new in changes[:6])
+            + (" ..." if len(changes) > 6 else ""), flush=True)
 
     def restore(self):
         """Put back the entries as they were when last set: after a keymap
@@ -208,12 +255,30 @@ class Keymap:
 
     def _restore(self):
         tables = set(self.tables())
+        failed = False
         for (table, keycode), value in self.saved.items():
             if table in tables:
                 try:
                     self.set(table, keycode, value)
                 except OSError:
                     traceback.print_exc()
+                    failed = True
+        print(f"keymap: restored {len(self.saved)} entries", flush=True)
+        if not failed:
+            try:
+                os.unlink(KEYMAP_STATE)
+            except FileNotFoundError:
+                pass
+
+
+def device_name(fd):
+    """The input device's name, for the log."""
+    buf = bytearray(256)
+    try:
+        n = fcntl.ioctl(fd, 0x81004506, buf)     # EVIOCGNAME(256)
+    except OSError:
+        return f"fd {fd}"
+    return bytes(buf[:max(0, n - 1)]).decode(errors="replace")
 
 
 def is_keyboard(path, media_keys):
@@ -478,11 +543,18 @@ class KeyboardLock:
     a crash, when the daemon starts again.
 
     With the console screen lock (ttysecurelock) on, the chord still unlocks the
-    keyboard, so the password can be typed; other keys stay dropped."""
+    keyboard, so the password can be typed; other keys stay dropped.
+
+    The grab waits until no key but the volume buttons is held: a key
+    released while grabbed stays down in the console's keyboard state, and a
+    stuck Win (ShiftL in the console keymap here) selects a missing keymap
+    table, so the console typed nothing at all after the unlock. The volume
+    buttons are holes in the console keymap: a stuck one changes nothing."""
 
     def __init__(self, media_keys):
         self.possible = set(VOLUME_PAIR) <= media_keys
         self.locked = False
+        self.grab_pending = False   # locked, waiting for the keys to come up
         self.grabbed = set()
         self.pending = None     # (code, deadline): a volume press
         self.chord = set()      # volume keys used up by a chord until released
@@ -496,8 +568,18 @@ class KeyboardLock:
                 try:
                     fcntl.ioctl(fd, EVIOCGRAB, 1)
                     self.grabbed.add(fd)
-                except OSError:
-                    traceback.print_exc()
+                    print(f"keyboard lock: grabbed {device_name(fd)}", flush=True)
+                except OSError as e:
+                    # EBUSY: another process holds the grab (a test harness,
+                    # another locker); its events do not reach the console.
+                    print(f"keyboard lock: cannot grab {device_name(fd)}: "
+                          f"{e.strerror}", flush=True)
+
+    def settle(self, fds, held):
+        """Grab once only the volume buttons (or nothing) are held."""
+        if self.grab_pending and not held - set(VOLUME_PAIR):
+            self.grab_pending = False
+            self.grab(fds)
 
     def forget(self, fd, fds, bar):
         """A keyboard went away: its grab went with it, and so did whatever
@@ -583,14 +665,17 @@ class KeyboardLock:
 
     # Locking.
 
-    def lock(self, fds, bar):
+    def lock(self, fds, bar, held):
         if self.locked:
             return
         if not self.possible or not self.unlockable(fds):
             bar.notify("Keyboard lock needs both volume buttons", WARNING)
             return
         self.locked = True
-        self.grab(fds)
+        self.grab_pending = True
+        print(f"keyboard lock: locked, grab when keys {sorted(held)} are up",
+              flush=True)
+        self.settle(fds, held)
         self.inhibit_pointers()
         bar.notify("Keyboard locked: press both volume buttons to unlock")
 
@@ -598,6 +683,9 @@ class KeyboardLock:
         if not self.locked:
             return
         self.locked = False
+        self.grab_pending = False
+        print(f"keyboard lock: unlocked, releasing {len(self.grabbed)} grabs",
+              flush=True)
         for fd in list(self.grabbed):
             try:
                 fcntl.ioctl(fd, EVIOCGRAB, 0)
@@ -631,7 +719,10 @@ class KeyboardLock:
             # button held longer has acted already: then this is no chord.
             self.pending = None
             self.chord |= {code, VOLUME_PAIR[code]}
-            (self.unlock if self.locked else self.lock)(fds, bar)
+            if self.locked:
+                self.unlock(fds, bar)
+            else:
+                self.lock(fds, bar, held)
             return
         if value == 1:
             self.flush(act)
@@ -1442,6 +1533,8 @@ def handle(held, device, code, value, media_keys, last_media, bar, lock, kbd,
         if code in media_keys and owner not in (None, device):
             return      # the release of a press the duplicate filter dropped
         held.discard(code)
+        if kbd.grab_pending:
+            kbd.settle(fds, held)
         if code in VOLUME_PAIR and kbd.possible:
             kbd.volume_key(code, 0, held, fds, bar, act)
         if code in WIN and not held & WIN:
@@ -1477,7 +1570,7 @@ def handle(held, device, code, value, media_keys, last_media, bar, lock, kbd,
     if value != 1 or not held & WIN or held & CTRL_ALT:
         return
     if code == KEY_K and not held & SHIFT:
-        kbd.lock(fds, bar)
+        kbd.lock(fds, bar, held)
     elif code == KEY_ESC and not held & SHIFT:
         tty = foreground_text_vt()
         if tty:
@@ -1522,7 +1615,7 @@ def run(keymap, media_keys, bar, lock, typer, kbd):
         if time.monotonic() >= next_scan:
             try:
                 scan(fds, media_keys)
-                if kbd.locked:
+                if kbd.locked and not kbd.grab_pending:
                     kbd.grab(fds)       # keyboards plugged in while locked
                 keymap.apply()
                 if not lock.active():
@@ -1587,6 +1680,8 @@ def run(keymap, media_keys, bar, lock, typer, kbd):
                 if held & WIN:
                     bar.win_up()
                 held.clear()
+                if kbd.grab_pending:
+                    kbd.settle(fds, held)
                 continue
             for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
                 _, _, type_, code, value = EVENT.unpack_from(data, i)

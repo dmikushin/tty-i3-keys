@@ -85,7 +85,7 @@ def main():
             except BlockingIOError:
                 return []
 
-        lock.lock(fds, bar)
+        lock.lock(fds, bar, set())
         vt.chord(kb, vt.KEY_A)
         failures += vt.check("locked: the other reader gets nothing, we do",
                              f"{drain(other)} {len(drain(ours)) > 0}".encode(),
@@ -144,21 +144,38 @@ def main():
                              f"{lock.locked} {acted}".encode(),
                              b"False [114, 115]")
 
+        # Locked while Win and K are still down (Win+K): the grab waits for
+        # them to come up, so the console sees their releases and no
+        # modifier stays down in its keyboard state.
+        lock.lock(fds, bar, {vt.KEY_LEFTMETA, vt.KEY_A})
+        vt.emit(kb, vt.KEY_A, 1)
+        vt.emit(kb, vt.KEY_A, 0)
+        before = drain(other)
+        lock.settle(fds, {vt.KEY_LEFTMETA})         # A up, Win still down
+        still = lock.grab_pending
+        lock.settle(fds, set())                      # Win up too
+        vt.chord(kb, vt.KEY_A)
+        failures += vt.check("grab waits until the held keys are up",
+                             f"{len(before) > 0} {still} {lock.grab_pending} "
+                             f"{drain(other)}".encode(), b"True True False []")
+        lock.unlock(fds, bar)
+        drain(ours)
+
         # A keyboard without volume buttons cannot be locked: no way out.
         plain = os.open("/dev/null", os.O_RDONLY)
-        lock.lock({plain: "/dev/null"}, bar)
+        lock.lock({plain: "/dev/null"}, bar, set())
         failures += vt.check("no volume buttons: lock refused",
                              f"{lock.locked} {inhibited()}".encode(), b"False 0")
         os.close(plain)
 
         # The volume-button keyboard unplugged while locked: unlocked.
-        lock.lock(fds, bar)
+        lock.lock(fds, bar, set())
         lock.forget(ours, {}, bar)
         failures += vt.check("volume keyboard gone while locked: unlocked",
                              f"{lock.locked} {inhibited()}".encode(), b"False 0")
         fcntl.ioctl(ours, d.EVIOCGRAB, 0)   # it did not really go away
 
-        lock.lock(fds, bar)
+        lock.lock(fds, bar, set())
         restarted = d.KeyboardLock({vt.KEY_VOLUMEUP, vt.KEY_VOLUMEDOWN})
         failures += vt.check("a restarted daemon puts back the touchpad",
                              f"{inhibited()} {os.path.exists(d.POINTERS_STATE)}"

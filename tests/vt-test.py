@@ -569,6 +569,12 @@ def typing_test():
 
 
 def main():
+    # Optional names of the parts to run (default: all), e.g. `kbdlock`
+    # on a machine whose console is in use: render typing brightness
+    # bar feedback socket kbdlock crash tmux lock. Setup, teardown and
+    # the final keymap check always run.
+    parts = set(sys.argv[1:])
+    want = lambda name: not parts or name in parts
     # One VT test at a time (ttysecurelock's test takes the same lock).
     lockfile = open("/tmp/vt12-test.lock", "w")
     fcntl.flock(lockfile, fcntl.LOCK_EX)
@@ -584,7 +590,7 @@ def main():
             pid = int(f.read().rsplit(")", 1)[1].split()[1])
     if any(int(p) not in ours for p in others):
         sys.exit("another VT test is running: it would fight over the VTs")
-    failures = render_test()
+    failures = render_test() if want("render") else 0
     original_vt = open("/sys/class/tty/tty0/active").read().strip()[3:]
     active = [s for s in SERVICES if subprocess.run(
         ["systemctl", "is-active", "--quiet", s]).returncode == 0]
@@ -629,13 +635,14 @@ def main():
                 chord(kb, key)
             chord(kb, KEY_2)
 
-        got = run_reader(3.0, typing)
-        expected = b"1!\x01" + "й".encode() + b"q"
-        expected += b"".join(TOGGLE_OUTPUT[k] for k in
-                             (KEY_VOLUMEDOWN, KEY_VOLUMEUP) if k in reserved)
-        expected += b"2"
-        failures += check("typing; Win+1 and media keys type nothing", got,
-                          expected)
+        if want("typing"):
+            got = run_reader(3.0, typing)
+            expected = b"1!\x01" + "й".encode() + b"q"
+            expected += b"".join(TOGGLE_OUTPUT[k] for k in
+                                 (KEY_VOLUMEDOWN, KEY_VOLUMEUP) if k in reserved)
+            expected += b"2"
+            failures += check("typing; Win+1 and media keys type nothing", got,
+                              expected)
 
         # 2. Brightness (acts on any VT).
         def bright():
@@ -646,10 +653,11 @@ def main():
             time.sleep(0.3)
             bright.up = backlight()[1]
 
-        run_reader(1.5, bright)
-        failures += check("brightness down then up",
-                          str(bright.down < bl_before and bright.up > bright.down
-                              ).encode(), b"True")
+        if want("brightness"):
+            run_reader(1.5, bright)
+            failures += check("brightness down then up",
+                              str(bright.down < bl_before and bright.up > bright.down
+                                  ).encode(), b"True")
 
         # The Win-held status bar, on a VT of the user.
         def bar(redraw):
@@ -671,18 +679,19 @@ def main():
                 bar.after_a, bar.after_u = bottom_row("a"), bottom_row("u")
             return actions
 
-        run_reader(18.0, bar(False))
-        failures += check("Win shows the i3blocks bar (time hh:mm)",
-                          str(bool(re.search(r"\d\d:\d\d", bar.shown))).encode(),
-                          b"True")
-        print(f"  bar: {bar.shown.strip()!r}")
-        failures += check("release restores the row byte-exact",
-                          str(bar.after_a == bar.before).encode(), b"True")
-        run_reader(18.0, bar(True), "redraw")
-        # REDRAWN replaced the 7 cells of "BOTTOM ".
-        failures += check("release keeps what the program redrew",
-                          bar.after_u.rstrip().encode(),
-                          b"REDRAWNROW OF THE PROGRAM")
+        if want("bar"):
+            run_reader(18.0, bar(False))
+            failures += check("Win shows the i3blocks bar (time hh:mm)",
+                              str(bool(re.search(r"\d\d:\d\d", bar.shown))).encode(),
+                              b"True")
+            print(f"  bar: {bar.shown.strip()!r}")
+            failures += check("release restores the row byte-exact",
+                              str(bar.after_a == bar.before).encode(), b"True")
+            run_reader(18.0, bar(True), "redraw")
+            # REDRAWN replaced the 7 cells of "BOTTOM ".
+            failures += check("release keeps what the program redrew",
+                              bar.after_u.rstrip().encode(),
+                              b"REDRAWNROW OF THE PROGRAM")
 
         # Feedback pops up in the bar at column 0 and goes away by itself.
         def feedback():
@@ -711,55 +720,67 @@ def main():
             feedback.restored = bottom_row("a") == before
             feedback.texts = texts
 
-        run_reader(12.0, feedback)
-        texts = feedback.texts
-        for t in texts:
-            print(f"  bar: {t!r}")
-        if KEY_VOLUMEUP not in reserved:
-            failures += check("volume up by 3", feedback.volume.encode(), b"53")
-            failures += check("volume shown at column 0",
-                              str(texts.pop(0).startswith("Volume: 53%")).encode(),
+        if want("feedback"):
+            run_reader(12.0, feedback)
+            texts = feedback.texts
+            for t in texts:
+                print(f"  bar: {t!r}")
+            if KEY_VOLUMEUP not in reserved:
+                failures += check("volume up by 3", feedback.volume.encode(), b"53")
+                failures += check("volume shown at column 0",
+                                  str(texts.pop(0).startswith("Volume: 53%")).encode(),
+                                  b"True")
+            failures += check("mute toggles", feedback.mute.encode(),
+                              b"false" if mute_before == "true" else b"true")
+            failures += check("mute shown at column 0",
+                              str(texts.pop(0).startswith("Volume: ")).encode(),
                               b"True")
-        failures += check("mute toggles", feedback.mute.encode(),
-                          b"false" if mute_before == "true" else b"true")
-        failures += check("mute shown at column 0",
-                          str(texts.pop(0).startswith("Volume: ")).encode(),
-                          b"True")
-        failures += check("Win+Shift+S toggles the inhibitor and back",
-                          str(feedback.lid).encode(),
-                          str([not inhibited_before, inhibited_before]).encode())
-        failures += check("lid state shown at column 0",
-                          str([t.startswith("Suspend on lid close: ")
-                               for t in texts]).encode(), b"[True, True]")
-        failures += check("row restored byte-exact after the message",
-                          str(feedback.restored).encode(), b"True")
+            failures += check("Win+Shift+S toggles the inhibitor and back",
+                              str(feedback.lid).encode(),
+                              str([not inhibited_before, inhibited_before]).encode())
+            failures += check("lid state shown at column 0",
+                              str([t.startswith("Suspend on lid close: ")
+                                   for t in texts]).encode(), b"[True, True]")
+            failures += check("row restored byte-exact after the message",
+                              str(feedback.restored).encode(), b"True")
 
-        failures += typing_test()
-        failures += kbdlock_test(kb, reserved, crash_restart)
+        if want("socket"):
+            failures += typing_test()
+        if want("kbdlock"):
+            failures += kbdlock_test(kb, reserved, crash_restart)
+        if want("crash"):
+            # Killed without restoring the keymap, on every machine
+            # (kbdlock does it only where the volume keys are free):
+            # the next instance must restore the originals, checked
+            # at the end.
+            crash_restart()
+            time.sleep(0.8)
 
-        # A user's tmux on the VT.
-        conf = tempfile.mktemp()
-        open(conf, "w").write("set -g base-index 1\n")
-        os.chmod(conf, 0o644)
-        subprocess.run(["openvt", "-c", str(VT), "-f", "--", "sh", "-c",
-                        f'chown {USER.pw_uid} {TTY}; TERM=linux exec runuser '
-                        f'-u {USER.pw_name} -- {" ".join(tmux)} -f {conf} '
-                        'new-session "sleep 60"'], check=True)
-        subprocess.run(["chvt", str(VT)], check=True)
-        time.sleep(1.5)
-        for _ in range(2):
-            as_user(*tmux, "new-window", "-d", "sleep 60")
-        index = lambda: as_user(*tmux, "display", "-p", "#{window_index}")
-        seen = []
-        for key in (KEY_2, KEY_3, KEY_1):
-            chord(kb, KEY_LEFTMETA, key)
-            time.sleep(0.4)
-            seen.append(index())
-        failures += check("Win+2, Win+3, Win+1 select tmux windows",
-                          " ".join(seen).encode(), b"2 3 1")
-        as_user(*tmux, "kill-server")
+        if want("tmux"):
+            # A user's tmux on the VT.
+            conf = tempfile.mktemp()
+            open(conf, "w").write("set -g base-index 1\n")
+            os.chmod(conf, 0o644)
+            subprocess.run(["openvt", "-c", str(VT), "-f", "--", "sh", "-c",
+                            f'chown {USER.pw_uid} {TTY}; TERM=linux exec runuser '
+                            f'-u {USER.pw_name} -- {" ".join(tmux)} -f {conf} '
+                            'new-session "sleep 60"'], check=True)
+            subprocess.run(["chvt", str(VT)], check=True)
+            time.sleep(1.5)
+            for _ in range(2):
+                as_user(*tmux, "new-window", "-d", "sleep 60")
+            index = lambda: as_user(*tmux, "display", "-p", "#{window_index}")
+            seen = []
+            for key in (KEY_2, KEY_3, KEY_1):
+                chord(kb, KEY_LEFTMETA, key)
+                time.sleep(0.4)
+                seen.append(index())
+            failures += check("Win+2, Win+3, Win+1 select tmux windows",
+                              " ".join(seen).encode(), b"2 3 1")
+            as_user(*tmux, "kill-server")
 
-        failures += lock_test(kb, restart_daemon)
+        if want("lock"):
+            failures += lock_test(kb, restart_daemon)
 
     finally:
         as_user(*tmux, "kill-server")

@@ -46,6 +46,9 @@ How it works:
   are left alone. The handled media keys become holes,
   so they do not also type `F13`/`F14`/`Help`. The original entries are
   restored when the daemon stops and re-applied if the keymap is reloaded.
+  The original entries are written to `/run/tty-i3-keys/keymap-original`
+  before the first change, so an instance started after one that was killed
+  (SIGKILL, a crash) still restores the real originals.
 - Keys that the `KEYMAP_TOGGLE` file of `/etc/vconsole.conf` maps on purpose
   are left to the console. On a laptop whose `Fn+Left/Right` arrive as
   volume keys and are mapped to Home/End there, they stay Home/End.
@@ -122,7 +125,8 @@ media keys type nothing. It checks that holding Win shows the i3blocks bar
 and releasing it restores the row byte-exact, keeping a program's redraw.
 It also tests brightness, volume, mute and the `Win+Shift+S` lid toggle
 with their messages at column 0, the row restore after a message, tmux
-window switching on a real tmux, and keymap restore. The lock is tested
+window switching on a real tmux, and keymap restore (also after a daemon
+killed with SIGKILL). `tests/vt-test.py kbdlock crash` runs only some parts. The lock is tested
 with a throwaway user created with a known password and deleted afterwards:
 `Win+Escape` starts ttysecurelock for that user on a VT from the top,
 `Ctrl+Alt+F1`, root's `VT_ACTIVATE`, `Ctrl+C`, `Ctrl+Z` and `Ctrl+\` do not
