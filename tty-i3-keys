@@ -1360,8 +1360,13 @@ class Lock:
 # --- Typing on the console for its owner (nerd-dictation) -----------------
 
 TYPE_SOCKET = "/run/tty-i3-keys-type.sock"
-TYPE_MAX_BYTES = 64 * 1024
+TYPE_MAX_BYTES = 16 * 1024
 TYPE_CLIENT_SECONDS = 2         # a client must have sent all its text by then
+# Pause after each character, like a keyboard: a program may read its input
+# one key at a time and lose keys that arrive back to back (the Dario prompt
+# dropped whole words when a dictated phrase came in as one burst). 12 ms is
+# xdotool type's default delay, which nerd-dictation relies on under X.
+TYPE_CHAR_SECONDS = 0.012
 TYPE_MAX_CLIENTS = 4
 TIOCSTI = 0x5412
 UCRED = struct.Struct("3i")     # struct ucred: pid, uid, gid
@@ -1375,7 +1380,9 @@ class TypeService:
     is 0). nerd-dictation types its text through this socket when the
     console, not X, is in front. Protocol: connect, send the UTF-8 bytes,
     shut down the sending side, read one reply line:
-      ok        typed (an empty request only asks, and types nothing);
+      ok        typed, at keyboard pace (TYPE_CHAR_SECONDS per character),
+                so the reply comes when the last character is in (an empty
+                request only asks, and types nothing);
       x         the VT in front is in graphics mode: X takes the text;
       denied: <reason>   not typed.
     Who may type is decided by the peer's uid (SO_PEERCRED), not by the
@@ -1458,18 +1465,22 @@ class TypeService:
                 return "denied: the console is locked"
             if owner == 0 or owner != uid:
                 return "denied: the console in front is not yours"
-            # Every byte goes in only while the VT is still in front, still
-            # this user's and not locked: a switch, a logout or Win+Escape
-            # mid-text stops the rest. (The fd stays bound to this VT, so a
-            # switch could never send the text to another one.)
+            # Every character goes in only while the VT is still in front,
+            # still this user's and not locked: a switch, a logout or
+            # Win+Escape mid-text stops the rest. (The fd stays bound to this
+            # VT, so a switch could never send the text to another one.) The
+            # bytes of one character go in together, then the key pause.
+            text = data.decode("utf-8", errors="replace")
             with open("/sys/class/tty/tty0/active") as active:
-                for byte in data:
+                for char in text:
                     active.seek(0)
                     if "/dev/" + active.read().strip() != tty:
                         return "denied: the console was switched"
                     if os.fstat(fd).st_uid != uid or self.lock.active():
                         return "denied: the console changed hands"
-                    fcntl.ioctl(fd, TIOCSTI, bytes([byte]))
+                    for byte in char.encode():
+                        fcntl.ioctl(fd, TIOCSTI, bytes([byte]))
+                    time.sleep(TYPE_CHAR_SECONDS)
             return "ok"
         finally:
             os.close(fd)
