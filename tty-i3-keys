@@ -142,6 +142,46 @@ def console_toggle_keys():
         return set()
 
 
+KDGKBMODE, K_UNICODE = 0x4B44, 0x03
+VT_GETSTATE = 0x5603
+
+
+def unicode_vt():
+    """An fd of an allocated VT whose keyboard is in Unicode mode, or None.
+
+    The keymap is global, but KDGKBENT/KDSKBENT convert entries by the
+    keyboard mode of the VT they are issued on: through a VT that is not in
+    Unicode mode (X's VT, a raw-mode lock VT) Unicode entries read as
+    K_HOLE and writing one fails with EINVAL (measured). /dev/tty0 is
+    whatever VT is in front, so reading "original" entries through it while
+    X is in front would record holes, and restoring them would write the
+    holes over real keys. Candidates: the VT in front, then the allocated
+    VTs 1-15 (VT_GETSTATE; opening an unallocated VT would allocate it)."""
+    with open("/sys/class/tty/tty0/active") as f:
+        front = int(f.read().strip()[3:])
+    fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+    try:
+        state = bytearray(6)
+        fcntl.ioctl(fd, VT_GETSTATE, state)
+        in_use = struct.unpack("HHH", state)[2]
+    finally:
+        os.close(fd)
+    for vt in [front] + [n for n in range(1, 16) if in_use >> n & 1 and n != front]:
+        try:
+            fd = os.open(f"/dev/tty{vt}", os.O_RDONLY | os.O_NOCTTY)
+        except OSError:
+            continue
+        mode = bytearray(4)
+        try:
+            fcntl.ioctl(fd, KDGKBMODE, mode)
+            if struct.unpack("i", mode)[0] == K_UNICODE:
+                return fd
+        except OSError:
+            pass
+        os.close(fd)
+    return None
+
+
 class Keymap:
     """Console keymap entries this daemon owns, set in every allocated table:
     the Win keys become the kernel's ShiftL modifier - no table for a ShiftL
@@ -166,7 +206,19 @@ class Keymap:
         self.fd = None
         self.entries = entries      # keycode -> value to set
         self.saved = self.load()    # (table, keycode) -> original entry
+        self.no_unicode_vt = False
         self.warned = False
+
+    def open_unicode_vt(self):
+        fd = unicode_vt()
+        if fd is None:
+            if not self.no_unicode_vt:
+                print("keymap: no VT in Unicode mode, keymap left alone until "
+                      "there is one", flush=True)
+            self.no_unicode_vt = True
+        else:
+            self.no_unicode_vt = False
+        return fd
 
     @staticmethod
     def load():
@@ -206,7 +258,9 @@ class Keymap:
         return [t for t in range(NR_KEYMAPS) if self.get(t, 0) != K_NOSUCHMAP]
 
     def apply(self):
-        self.fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+        self.fd = self.open_unicode_vt()
+        if self.fd is None:
+            return
         try:
             self._apply()
         finally:
@@ -246,7 +300,9 @@ class Keymap:
     def restore(self):
         """Put back the entries as they were when last set: after a keymap
         reload that is the reloaded value, which is the one to keep."""
-        self.fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+        self.fd = self.open_unicode_vt()
+        if self.fd is None:
+            return
         try:
             self._restore()
         finally:

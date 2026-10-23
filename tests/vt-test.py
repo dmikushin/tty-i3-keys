@@ -151,7 +151,9 @@ def as_user(*argv):
 
 
 def keymap_entries():
-    fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+    # Through a Unicode-mode VT: through /dev/tty0 with X in front, Unicode
+    # entries would read as holes (see unicode_vt in the daemon).
+    fd = daemon_module().unicode_vt()
     out = []
     for table in range(256):
         for key in (0, 125, 126, 113, 114, 115, 224, 225):
@@ -170,6 +172,66 @@ def daemon_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+def kb_entry(fd, table, key, value=None):
+    if value is None:
+        buf = bytearray(struct.pack("BBH", table, key, 0))
+        fcntl.ioctl(fd, 0x4B46, buf)            # KDGKBENT
+        return struct.unpack("BBH", buf)[2]
+    fcntl.ioctl(fd, 0x4B47, struct.pack("BBH", table, key, value))   # KDSKBENT
+
+
+def keymap_snapshot(fd):
+    """Every entry of every allocated table, read through a Unicode VT."""
+    return {(t, k): kb_entry(fd, t, k) for t in range(256)
+            if kb_entry(fd, t, 0) != 0x027F for k in range(256)}
+
+
+def unicode_keymap_test():
+    """The daemon must keep Unicode keymap entries even when the VT in front
+    is not in Unicode mode (X): read through such a VT they look like holes,
+    and an instance that took that for the original would write holes over
+    them on exit. A Unicode value (U+0441) is put where the daemon acts
+    (Win, keycode 125, table 2) and must come back after a clean stop and
+    after SIGKILL + restart + stop; the whole keymap must be unchanged."""
+    m = daemon_module()
+    fd = m.unicode_vt()
+    front = open("/sys/class/tty/tty0/active").read().strip()
+    tfd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+    mode = bytearray(4)
+    fcntl.ioctl(tfd, 0x4B44, mode)              # KDGKBMODE
+    os.close(tfd)
+    print(f"  VT in front: {front}, keyboard mode {struct.unpack('i', mode)[0]}"
+          f" (3 = Unicode; X is not)")
+    before = keymap_snapshot(fd)
+    slot, value = (2, 125), 0xf441
+    original = kb_entry(fd, *slot)
+    kb_entry(fd, *slot, value)
+    seen = []
+    try:
+        d = subprocess.Popen([sys.executable, DAEMON])
+        time.sleep(1.2)
+        seen.append(kb_entry(fd, *slot))        # Win: ShiftL while running
+        d.terminate(); d.wait()
+        seen.append(kb_entry(fd, *slot))        # back after a clean stop
+        d = subprocess.Popen([sys.executable, DAEMON])
+        time.sleep(1.2)
+        d.kill(); d.wait()
+        d = subprocess.Popen([sys.executable, DAEMON])
+        time.sleep(1.2)
+        d.terminate(); d.wait()
+        seen.append(kb_entry(fd, *slot))        # back after SIGKILL + restart
+    finally:
+        kb_entry(fd, *slot, original)
+        after = keymap_snapshot(fd)
+        os.close(fd)
+    failures = check("Unicode entry kept with X in front (run, stop, kill+restart)",
+                     " ".join(f"{v:#06x}" for v in seen).encode(),
+                     b"0x0704 0xf441 0xf441")
+    failures += check("whole keymap unchanged", str(after == before).encode(),
+                      b"True")
+    return failures
 
 
 def toggle_keys():
@@ -571,7 +633,7 @@ def typing_test():
 def main():
     # Optional names of the parts to run (default: all), e.g. `kbdlock`
     # on a machine whose console is in use: render typing brightness
-    # bar feedback socket kbdlock crash tmux lock. Setup, teardown and
+    # bar feedback socket kbdlock crash tmux lock unicode. Setup, teardown and
     # the final keymap check always run.
     parts = set(sys.argv[1:])
     want = lambda name: not parts or name in parts
@@ -596,6 +658,9 @@ def main():
         ["systemctl", "is-active", "--quiet", s]).returncode == 0]
     for s in active:
         subprocess.run(["systemctl", "stop", s], check=True)
+    if want("unicode"):
+        # Before any VT switch: with X in front, as on a laptop running i3.
+        failures += unicode_keymap_test()
     keymap_before = keymap_entries()
     reserved = toggle_keys()
     bl_path, bl_before = backlight()
