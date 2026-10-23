@@ -4,9 +4,9 @@ Description=i3 hotkeys on text consoles (Win+1..0 tmux windows, Win+Escape lock,
 [Service]
 ExecStart=/usr/local/bin/tty-i3-keys
 Restart=always
-# The toggle script leaves a systemd-inhibit process running, and the
-# console lock (vlock) must keep the consoles locked: both must survive
-# restarts of this daemon.
+# The toggle script leaves a systemd-inhibit process running, which must
+# survive restarts of this daemon. (The console lock, ttysecurelock, runs in
+# a scope of its own, outside this unit.)
 KillMode=process
 
 [Install]

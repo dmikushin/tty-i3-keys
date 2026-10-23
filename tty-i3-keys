@@ -15,9 +15,10 @@ is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
                          VT's owner in their PipeWire session;
   brightness up/down     brightnessctl, as in the i3 config (never to 0);
   Win held               the i3 bar (i3's "mode hide" bar, "modifier Mod4");
-  Win+Escape             lock all consoles, like i3's xsecurelock: vlock -a
-                         on a spare VT, as the VT's owner, asking for that
-                         user's password (see Lock);
+  Win+Escape             lock all consoles, like i3's xsecurelock:
+                         ttysecurelock (xsecurelock's PAM path on the
+                         console), asking for the VT owner's password (see
+                         Lock);
   Win+O                  rotate the console 90 degrees clockwise (fbcon
                          rotate_all: 0, 90, 180, 270), for convertible
                          laptops; kept across reboots;
@@ -67,7 +68,6 @@ import stat
 import struct
 import subprocess
 import sys
-import termios
 import threading
 import time
 import traceback
@@ -477,7 +477,7 @@ class KeyboardLock:
     POINTERS_STATE before they are inhibited and put back on exit and, after
     a crash, when the daemon starts again.
 
-    With the console screen lock (vlock) on, the chord still unlocks the
+    With the console screen lock (ttysecurelock) on, the chord still unlocks the
     keyboard, so the password can be typed; other keys stay dropped."""
 
     def __init__(self, media_keys):
@@ -1148,38 +1148,11 @@ class Bar:
 
 # --- The console lock (Win+Escape) ----------------------------------------
 
-VT_GETMODE, VT_ACTIVATE, VT_DISALLOCATE = 0x5601, 0x5606, 0x5608
-VT_PROCESS = 1
-TIOCLINUX, TIOCL_SETSEL = 0x541C, 2
-TIOCL_SELPOINTER, TIOCL_SELCLEAR = 3, 4
-VT_MODE = struct.Struct("bbhhh")    # struct vt_mode
+TTYSECURELOCK = "/usr/local/bin/ttysecurelock"
 LOCK_STATE = "/run/tty-i3-keys/lock.json"
-# Spare VTs for the lock, from the top: far from getty's autovt range
-# (logind NAutoVTs, 6), which would start a getty on it and hang it up.
-LOCK_VTS = range(63, 12, -1)
-LOCK_START_SECONDS = 3
-
-
-def vt_allocated(n):
-    """Has the kernel allocated VT n? /dev/vcsN of an unallocated VT is
-    missing or fails with ENXIO, and, unlike /dev/ttyN, opening it
-    allocates nothing."""
-    try:
-        os.close(os.open(f"/dev/vcs{n}", os.O_RDONLY))
-        return True
-    except OSError as e:
-        # udev removes the vcs nodes of a VT when it is freed.
-        if e.errno in (errno.ENXIO, errno.ENOENT):
-            return False
-        raise
-
-
-def spare_vt(exclude):
-    """A VT nothing uses: not allocated by the kernel, so no getty or
-    program holds it (not even through an alias such as /dev/console)."""
-    return next((n for n in LOCK_VTS if n not in exclude
-                 and os.path.exists(f"/dev/tty{n}") and not vt_allocated(n)),
-                None)
+# How long a starting lock may take to bring its VT to the front before the
+# daemon stops waiting for it (it keeps watching the process either way).
+LOCK_START_SECONDS = 5
 
 
 def process_start(pid):
@@ -1189,28 +1162,46 @@ def process_start(pid):
         return int(f.read().rsplit(")", 1)[1].split()[19])
 
 
+def running_lock():
+    """A running ttysecurelock (root's: no user can start one that locks),
+    as {"pid", "start"}, or None."""
+    for comm in glob.glob("/proc/[0-9]*/comm"):
+        pid = int(comm.split("/")[2])
+        try:
+            with open(comm) as f:
+                if f.read().strip() != "ttysecurelock":
+                    continue
+            if os.stat(f"/proc/{pid}").st_uid != 0:
+                continue
+            return {"pid": pid, "start": process_start(pid)}
+        except OSError:
+            continue
+    return None
+
+
 class Lock:
-    """The counterpart of i3's xsecurelock on the text console.
+    """The counterpart of i3's xsecurelock on the text console: ttysecurelock
+    (github.com/dmikushin/ttysecurelock), xsecurelock's PAM path without X.
 
-    kbd's `vlock -a` runs as the owner of the foreground VT, so it asks for
-    that user's password (PAM service "vlock"), on a spare VT, so the screen
-    of the locked VT is hidden. -a puts its VT in VT_PROCESS mode and refuses
-    every release request: no Ctrl+Alt+Fn, no chvt, not even root's
-    VT_ACTIVATE, reaches another VT (or X) until it exits. It ignores
-    SIGINT/SIGQUIT/SIGTSTP/SIGTERM/SIGHUP, so Ctrl+C, Ctrl+\\, Ctrl+Z do
-    nothing. It is its own session, outside this daemon's process group, and
-    the unit has KillMode=process: stopping or restarting this daemon leaves
-    the lock in place; the new daemon adopts it from LOCK_STATE. When vlock
-    exits (the right password), the daemon switches back to the VT that was
-    locked and frees the spare VT.
+    It runs as root and locks for the owner of the VT that was in front,
+    passed as --user: it takes a free VT from the top (above logind's autovt
+    range), puts it in VT_PROCESS mode and refuses every switch away, sets
+    VT_LOCKSWITCH, reads the keyboard raw (Ctrl+C, Ctrl+Z, Ctrl+\\ do
+    nothing) and checks each password with xsecurelock's authproto_pam run as
+    that user. On the right password it switches back and frees its VT.
+    Running as root, the user's own processes cannot signal it; if root kills
+    it, switching stays locked (fail closed).
 
-    The VT stays root's: vlock reaches it through /dev/tty, its controlling
-    terminal, so other processes of the user cannot open it."""
+    It is started in a transient scope of its own (systemd-run --scope), so
+    it is outside this daemon's cgroup and session: stopping or restarting
+    the daemon leaves the lock in place, and the new daemon adopts it from
+    LOCK_STATE. While it runs, the daemon's hotkeys, bar and typing service
+    are off. The VT handling is entirely the lock's own; the daemon only
+    starts it and watches it."""
 
     def __init__(self):
-        self.state = None       # {"pid", "start", "vt", "back"}
+        self.state = None       # {"pid", "start"}
         self.pidfd = None
-        self.to_free = set()    # spare VTs to deallocate
         self.adopt()
 
     def active(self):
@@ -1225,85 +1216,69 @@ class Lock:
         uid = os.stat(tty).st_uid
         if uid == 0:
             return              # a login prompt: there is no session to lock
-        back = int(tty.removeprefix("/dev/tty"))
-        vt = spare_vt({back})
-        if vt is None:
-            bar.notify("Lock: no spare console", ERROR)
+        if not os.access(TTYSECURELOCK, os.X_OK):
+            bar.notify("Lock: ttysecurelock is not installed", ERROR)
             return
         bar.stop()              # nothing of the session stays on screen
-        user, identity = user_identity(uid)
-        identity["env"].update(LOGNAME=user.pw_name, USER=user.pw_name,
-                               TERM="linux")
-        fd = os.open(f"/dev/tty{vt}", os.O_RDWR | os.O_NOCTTY)
-        try:
-            os.write(fd, b"\033[H\033[2J")
-            proc = subprocess.Popen(
-                ["vlock", "-a"], **identity, cwd="/",
-                stdin=fd, stdout=fd, stderr=fd, start_new_session=True,
-                # The VT must be vlock's controlling terminal (/dev/tty).
-                preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
-            # Show the lock only once it holds the VT: VT_PROCESS set.
-            deadline = time.monotonic() + LOCK_START_SECONDS
-            while True:
-                mode = VT_MODE.unpack(fcntl.ioctl(fd, VT_GETMODE,
-                                                  bytes(VT_MODE.size)))[0]
-                if mode == VT_PROCESS:
-                    break
-                if proc.poll() is not None or time.monotonic() > deadline:
-                    proc.kill()
-                    proc.wait()
-                    bar.notify("Lock: vlock did not start", ERROR)
-                    return
-                time.sleep(0.02)
-        finally:
-            os.close(fd)
-        self.state = {"pid": proc.pid, "start": process_start(proc.pid),
-                      "vt": vt, "back": back}
+        name = pwd.getpwuid(uid).pw_name
+        back = tty.removeprefix("/dev/")
+        # systemd-run --scope execs the lock itself in a new scope: the pid
+        # is the lock's. "--" ends systemd-run's options ("--user" is one of
+        # them too), so the rest is the lock's command line.
+        proc = subprocess.Popen(
+            ["systemd-run", "--scope", "--quiet", "--collect",
+             f"--unit=ttysecurelock-{name}-{time.monotonic_ns()}",
+             "--", TTYSECURELOCK, "--user", name],
+            stdin=subprocess.DEVNULL, start_new_session=True)
+        # The state first: a daemon that dies from here on leaves it for its
+        # successor, which adopts the running lock.
+        self.state = {"pid": proc.pid, "start": process_start(proc.pid)}
         self.pidfd = os.pidfd_open(proc.pid)
-        # The state first, then the switch: a daemon that dies in between
-        # leaves state for its successor, whose adopt() completes the
-        # switch - never a running lock with the session still on screen.
         os.makedirs(os.path.dirname(LOCK_STATE), mode=0o700, exist_ok=True)
         with open(LOCK_STATE + ".new", "w") as f:
             json.dump(self.state, f)
         os.replace(LOCK_STATE + ".new", LOCK_STATE)
-        self.enforce()
-
-    def enforce(self):
-        """A live lock is in front: switch to it if it is not (a switch that
-        did not happen yet, after a restart). Switching to a VT_PROCESS
-        console is an acquisition, which vlock does not refuse."""
-        if self.to_free:
-            self.free_spare()
-        if not self.active():
-            return
-        with open("/sys/class/tty/tty0/active") as f:
-            if f.read().strip() == f"tty{self.state['vt']}":
+        deadline = time.monotonic() + LOCK_START_SECONDS
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                # Refused before locking (no free VT, unknown user, ...):
+                # its reason is in the journal.
+                self.finish()
+                bar.notify(f"Lock: ttysecurelock failed ({proc.returncode})",
+                           ERROR)
                 return
-        with open("/dev/tty0", "rb") as tty0:
-            fcntl.ioctl(tty0, VT_ACTIVATE, self.state["vt"])
+            with open("/sys/class/tty/tty0/active") as f:
+                if f.read().strip() != back:
+                    return      # its VT is in front: locked
+            time.sleep(0.02)
 
     def adopt(self):
         """A lock left by a previous run of the daemon: keep watching it, or
-        clean up after it if it has ended."""
+        forget it if it has ended. A lock running without LOCK_STATE (the
+        daemon died between starting it and recording it, or someone ran
+        ttysecurelock by hand) is adopted too: whatever locks the consoles,
+        the daemon must stay off while it runs."""
+        state = None
         try:
             with open(LOCK_STATE) as f:
                 state = json.load(f)
-            pid, vt, back = state["pid"], state["vt"], state["back"]
+            if process_start(state["pid"]) != state["start"]:
+                state = None
         except (OSError, ValueError, KeyError, TypeError):
-            return
-        self.state = state
-        try:
-            if process_start(pid) == state["start"]:
-                self.pidfd = os.pidfd_open(pid)
-                self.enforce()
+            state = None
+        if state is None:
+            state = running_lock()
+        if state is not None:
+            try:
+                self.pidfd = os.pidfd_open(state["pid"])
+                self.state = state
                 return
-        except OSError:
-            pass
+            except OSError:
+                pass
         self.finish()
 
     def ended(self):
-        """Called when the pidfd is readable: vlock has exited."""
+        """Called when the pidfd is readable: the lock has exited."""
         try:
             os.waitpid(self.state["pid"], os.WNOHANG)
         except ChildProcessError:
@@ -1311,7 +1286,9 @@ class Lock:
         self.finish()
 
     def finish(self):
-        state, self.state = self.state, None
+        """Forget the lock. The VTs are its business: unlocked, it has gone
+        back and freed its VT; killed, it leaves switching locked on purpose."""
+        self.state = None
         if self.pidfd is not None:
             os.close(self.pidfd)
             self.pidfd = None
@@ -1319,42 +1296,6 @@ class Lock:
             os.unlink(LOCK_STATE)
         except FileNotFoundError:
             pass
-        with open("/dev/tty0", "rb") as tty0:
-            with open("/sys/class/tty/tty0/active") as f:
-                if f.read().strip() == f"tty{state['vt']}":
-                    fcntl.ioctl(tty0, VT_ACTIVATE, state["back"])
-        # The spare VT is freed once the switch is done and nothing holds it
-        # (EBUSY until then): now, else at a later rescan.
-        self.to_free.add(state["vt"])
-        self.free_spare()
-
-    def free_spare(self):
-        with open("/dev/tty0", "rb") as tty0:
-            for vt in list(self.to_free):
-                # The kernel will not free the console that owns the mouse
-                # selection, and the pointer of a console mouse daemon (gpm,
-                # console-mouse) drawn on the lock VT makes it the owner.
-                # Hand the selection to the console in front: a pointer
-                # there, cleared at once.
-                for mode in (TIOCL_SELPOINTER, TIOCL_SELCLEAR):
-                    try:
-                        fcntl.ioctl(tty0, TIOCLINUX, struct.pack(
-                            "<B5H", TIOCL_SETSEL, 1, 1, 1, 1, mode))
-                    except OSError:
-                        pass
-                for _ in range(10):
-                    try:
-                        fcntl.ioctl(tty0, VT_DISALLOCATE, vt)
-                        self.to_free.discard(vt)
-                        break
-                    except OSError as e:
-                        if e.errno != errno.EBUSY:
-                            print(f"lock: VT_DISALLOCATE {vt}: {e}", flush=True)
-                            self.to_free.discard(vt)
-                            break
-                        time.sleep(0.02)
-                else:
-                    print(f"lock: VT {vt} still busy, retried later", flush=True)
 
 
 # --- Typing on the console for its owner (nerd-dictation) -----------------
@@ -1584,7 +1525,8 @@ def run(keymap, media_keys, bar, lock, typer, kbd):
                 if kbd.locked:
                     kbd.grab(fds)       # keyboards plugged in while locked
                 keymap.apply()
-                lock.enforce()
+                if not lock.active():
+                    lock.adopt()        # a lock this daemon did not record
                 # Keep the bar's content ready for the user in front.
                 tty = foreground_text_vt()
                 if tty and os.stat(tty).st_uid != 0:

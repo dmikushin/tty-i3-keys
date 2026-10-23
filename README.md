@@ -11,7 +11,7 @@ foreground VT is in text mode (not X), acts for the user who owns that VT:
 | `Win+Shift+S` | toggle suspend on lid close, by the same `~/.config/i3/toggle-lid-suspend.sh` as i3 (shared state with X) |
 | volume up / down, mute | `pamixer -ui 3`, `pamixer -ud 3`, `pamixer -t` as in the i3 config, in the user's PipeWire session |
 | brightness up / down | `brightnessctl set +5%` / `5%-` as in the i3 config (never down to 0) |
-| `Win+Escape` | lock all consoles, the counterpart of i3's `xsecurelock`: asks for the VT owner's password |
+| `Win+Escape` | lock all consoles with [ttysecurelock](https://github.com/dmikushin/ttysecurelock), the counterpart of i3's `xsecurelock`: asks for the VT owner's password |
 | `Win+O` | rotate the console a quarter turn clockwise (fbcon `rotate_all`), for convertible laptops; kept across reboots in `/var/lib/tty-i3-keys/rotation` |
 | `Win+K`, or both volume buttons together | lock the keyboard (book-reader mode on a convertible folded into a tablet); only both volume buttons together unlock - see below |
 
@@ -56,31 +56,34 @@ How it works:
 
 ## The lock
 
-`Win+Escape` runs kbd's `vlock -a` as the owner of the VT, on a spare VT
-(63 downwards, away from getty's autovt range) with that VT as its
-controlling terminal, and switches to it: the locked screen is hidden and
-the password asked is that user's (PAM service `vlock`), as with
-`xsecurelock` under X.
+`Win+Escape` starts [ttysecurelock](https://github.com/dmikushin/ttysecurelock)
+— xsecurelock's PAM path on the text console — for the owner of the VT in
+front, so the password asked is that user's, checked by xsecurelock's own
+`authproto_pam`, as with `xsecurelock` under X. It must be installed
+(`/usr/local/bin/ttysecurelock`, `make install` in its repository).
 
-- `vlock -a` puts its VT in `VT_PROCESS` mode and refuses every release
-  request, so nothing switches away until it exits: not `Ctrl+Alt+Fn`, not
-  `chvt`, not root's `VT_ACTIVATE`. X on another VT is covered too.
-- It ignores `SIGINT`, `SIGQUIT`, `SIGTSTP`, `SIGTERM` and `SIGHUP`:
-  `Ctrl+C`, `Ctrl+\`, `Ctrl+Z` do nothing. A wrong password keeps it locked.
-- It runs in its own session, outside the daemon's process group, and the
-  unit has `KillMode=process`: stopping or restarting the daemon leaves the
-  lock in place. The new daemon adopts it from `/run/tty-i3-keys/lock.json`
-  (pid and start time, so a reused pid is not mistaken for it).
-- The spare VT stays root's; vlock reaches it only as its controlling
-  terminal, so other processes of the user cannot open it.
+- It runs as root, so the user's own processes (an ssh session, a cron job)
+  cannot kill or signal it — stronger than `xsecurelock` under X.
+- It takes a free VT from the top (63 downwards, above getty's autovt
+  range), puts it in `VT_PROCESS` mode, refuses every release request and
+  sets `VT_LOCKSWITCH`: nothing switches away until the right password — not
+  `Ctrl+Alt+Fn`, not `chvt`, not root's `VT_ACTIVATE`. X on another VT is
+  covered too. The keyboard is read raw: `Ctrl+C`, `Ctrl+\`, `Ctrl+Z` do
+  nothing. A wrong password keeps it locked.
+- The daemon starts it in a transient scope of its own (`systemd-run
+  --scope`), outside the daemon's cgroup and session: stopping or
+  restarting the daemon leaves the lock in place. The new daemon adopts it
+  from `/run/tty-i3-keys/lock.json` (pid and start time, so a reused pid is
+  not mistaken for it).
 - While locked, the daemon does nothing: no bar (it would show the user's
-  status), no tmux, volume, brightness or lid actions.
-- After the right password vlock exits; the daemon switches back to the VT
-  that was locked and frees the spare VT.
+  status), no tmux, volume, brightness or lid actions, and the typing
+  service refuses.
+- After the right password it switches back to the VT that was locked and
+  frees its VT itself.
 
-What it does not protect against, as with `xsecurelock`: another process of
-the same user (an ssh session, a cron job) can kill vlock and so unlock;
-root can. `Ctrl+Alt+Del` still reboots through systemd (no session survives
+What it does not protect against: root can kill it — then switching stays
+locked (`VT_LOCKSWITCH`), i.e. the console fails closed and root has to
+undo it. `Ctrl+Alt+Del` still reboots through systemd (no session survives
 that). Magic SysRq is what the kernel allows; on these laptops
 `kernel.sysrq = 16`, i.e. only sync.
 
@@ -121,10 +124,12 @@ It also tests brightness, volume, mute and the `Win+Shift+S` lid toggle
 with their messages at column 0, the row restore after a message, tmux
 window switching on a real tmux, and keymap restore. The lock is tested
 with a throwaway user created with a known password and deleted afterwards:
-`Win+Escape` starts vlock as that user on a spare VT, `Ctrl+Alt+F1`, root's
-`VT_ACTIVATE` and `Ctrl+C` do not get out, restarting the daemon does not
-unlock, a wrong password keeps it locked, the right one unlocks and returns
-to the VT. Volume, brightness and the lid state are put
+`Win+Escape` starts ttysecurelock for that user on a VT from the top,
+`Ctrl+Alt+F1`, root's `VT_ACTIVATE`, `Ctrl+C`, `Ctrl+Z` and `Ctrl+\` do not
+get out, the typing socket and `Win+Shift+S` do nothing, restarting the
+daemon does not unlock (the new daemon adopts the lock), a wrong password
+keeps it locked, the right one unlocks, returns to the VT and frees the
+lock VT. Volume, brightness and the lid state are put
 back afterwards. The typing socket is tested too: the VT owner's text
 arrives byte-exact, another user is refused, a VT in graphics mode answers
 `x`; with `NERD_DICTATION_DRIVER` set to nerd-dictation's built

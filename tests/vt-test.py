@@ -12,11 +12,13 @@ checks:
   4. volume and mute keys change the user's PipeWire volume (restored), and
      the level is shown in tmux;
   5. Win+Shift+S toggles the lid-switch inhibitor, twice = back as it was;
-  6. Win+Escape locks: vlock as the VT's owner (a throwaway user with a
-     known password, created and deleted here) on a spare VT; no VT switch
-     gets through, Ctrl+C does nothing, restarting the daemon does not
-     unlock, a wrong password keeps it locked, the right one unlocks and
-     returns to the VT;
+  6. Win+Escape locks: ttysecurelock for the VT's owner (a throwaway user
+     with a known password, created and deleted here) on a VT from the top;
+     no VT switch gets through, Ctrl+C, Ctrl+Z and Ctrl+backslash do
+     nothing, the typing socket and the Win hotkeys are off, restarting the
+     daemon does not unlock (the new daemon adopts the lock, also one it
+     has no record of), a wrong password keeps it locked, the right one
+     unlocks, returns to the VT and frees the lock VT;
   7. Win+K locks the keyboard: keys are dropped, a touchpad is inhibited, a
      lone volume key still changes the volume, both volume keys together
      unlock without changing it; a daemon killed while locked leaves no
@@ -49,11 +51,13 @@ KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
 KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
 KEY_ESC, KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1 = 1, 28, 46, 56, 59
 KEY_K = 37
+KEY_Z, KEY_BACKSLASH = 44, 43
 DIGIT_KEYS = {str(d % 10): 1 + d for d in range(1, 11)}    # KEY_1 = 2 .. KEY_0 = 11
 KEYS = (KEY_1, KEY_2, KEY_3, KEY_A, KEY_Q, KEY_S, KEY_LEFTCTRL,
         KEY_LEFTSHIFT, KEY_CAPSLOCK, KEY_LEFTMETA, KEY_MUTE, KEY_VOLUMEDOWN,
         KEY_VOLUMEUP, KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP, KEY_ESC,
-        KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1, KEY_K, *DIGIT_KEYS.values())
+        KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1, KEY_K, KEY_Z, KEY_BACKSLASH,
+        *DIGIT_KEYS.values())
 LOCK_USER = "ttyi3keyslocktest"
 LOCK_PASSWORD = "73914286"   # digits: the same in the Latin and Cyrillic layouts
 UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
@@ -263,16 +267,19 @@ def active_vt():
     return int(open("/sys/class/tty/tty0/active").read().strip()[3:])
 
 
-def vlock_pids(uid):
+def lock_pids(user=None):
+    """ttysecurelock processes (all of them, or those locking for `user`)."""
     pids = []
-    for status in glob.glob("/proc/[0-9]*/status"):
+    for comm in glob.glob("/proc/[0-9]*/comm"):
         try:
-            text = open(status).read()
+            if open(comm).read().strip() != "ttysecurelock":
+                continue
+            pid = comm.split("/")[2]
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
         except OSError:
             continue
-        if re.search(r"^Name:\s+vlock$", text, re.M) and re.search(
-                rf"^Uid:\s+{uid}\s", text, re.M):
-            pids.append(int(status.split("/")[2]))
+        if user is None or user.encode() in argv:
+            pids.append(int(pid))
     return pids
 
 
@@ -293,70 +300,115 @@ def lock_test(kb, restart_daemon):
         uid = pwd.getpwnam(LOCK_USER).pw_uid
         state = {}
 
+        def locked():
+            return active_vt(), bool(lock_pids(LOCK_USER))
+
         def actions():
             os.chown(TTY, uid, -1)
             time.sleep(0.3)
+            state["lid_before"] = inhibited()
             chord(kb, KEY_LEFTMETA, KEY_ESC)
-            for _ in range(30):
-                time.sleep(0.1)
-                if vlock_pids(uid) and active_vt() != VT:
-                    break
-            state["pids"] = vlock_pids(uid)
-            state["lock_vt"] = active_vt()
-            # Every way to leave: Ctrl+Alt+F1, root's VT_ACTIVATE, Ctrl+C.
-            chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_F1)
-            with open("/dev/tty0", "rb") as tty0:
-                fcntl.ioctl(tty0, 0x5606, VT)          # VT_ACTIVATE
-            chord(kb, KEY_LEFTCTRL, KEY_C)
-            time.sleep(0.5)
-            state["after_escapes"] = (active_vt(), bool(vlock_pids(uid)))
-            restart_daemon()
-            time.sleep(1.0)
-            state["after_restart"] = (active_vt(), bool(vlock_pids(uid)))
-            type_text(kb, "1111")
-            time.sleep(4.0)                 # pam_unix's delay after a failure
-            state["after_wrong"] = (active_vt(), bool(vlock_pids(uid)))
-            type_text(kb, LOCK_PASSWORD)
             for _ in range(50):
                 time.sleep(0.1)
-                if not vlock_pids(uid) and active_vt() == VT:
+                if lock_pids(LOCK_USER) and active_vt() != VT:
                     break
-            state["after_right"] = (active_vt(), bool(vlock_pids(uid)))
+            state["pids"] = lock_pids(LOCK_USER)
+            state["lock_vt"] = active_vt()
+            # Off while locked: the typing socket and the Win hotkeys.
+            state["typing"] = type_request(uid, "intruder")
+            chord(kb, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_S)
+            time.sleep(0.5)
+            state["lid_after"] = inhibited()
+            # Every way to leave: Ctrl+Alt+F1, root's VT_ACTIVATE, Ctrl+C,
+            # Ctrl+Z, Ctrl+backslash.
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_F1)
+            with open("/dev/tty0", "rb") as tty0:
+                try:
+                    fcntl.ioctl(tty0, 0x5606, VT)  # VT_ACTIVATE
+                except OSError:
+                    pass
+            for key in (KEY_C, KEY_Z, KEY_BACKSLASH):
+                chord(kb, KEY_LEFTCTRL, key)
+            time.sleep(0.5)
+            state["after_escapes"] = locked()
+            restart_daemon()
+            time.sleep(1.5)
+            state["after_restart"] = locked()
+            state["typing_after_restart"] = type_request(uid, "intruder")
+            # A lock the daemon did not record (it died right after starting
+            # it): the restarted daemon finds it running and stays off.
+            os.unlink("/run/tty-i3-keys/lock.json")
+            restart_daemon()
+            time.sleep(1.5)
+            state["after_unrecorded"] = locked()
+            state["typing_unrecorded"] = type_request(uid, "intruder")
+            chord(kb, KEY_ESC)              # Esc clears the password input
+            type_text(kb, "1111")
+            time.sleep(4.0)                 # pam_unix's delay after a failure
+            state["after_wrong"] = locked()
+            type_text(kb, LOCK_PASSWORD)
+            for _ in range(80):
+                time.sleep(0.1)
+                if not lock_pids(LOCK_USER) and active_vt() == VT:
+                    break
+            state["after_right"] = locked()
+            time.sleep(0.5)
+            state["lock_vt_freed"] = not os.path.exists(
+                f"/dev/vcs{state['lock_vt']}")
             # Switching works again.
             with open("/dev/tty0", "rb") as tty0:
                 fcntl.ioctl(tty0, 0x5606, 1)
             time.sleep(0.5)
             state["switch_after"] = active_vt()
             subprocess.run(["chvt", str(VT)])
-            time.sleep(6.0)                 # a rescan frees it at the latest
-            state["spare_freed"] = not os.path.exists(
-                f"/dev/vcs{state['lock_vt']}")
+            time.sleep(0.5)
 
-        run_reader(32.0, actions)
+        run_reader(30.0, actions)
         lock_vt = state["lock_vt"]
-        failures += check("Win+Escape: vlock runs as the VT's owner",
+        failures += check("Win+Escape: ttysecurelock locks for the VT's owner",
                           str(len(state["pids"])).encode(), b"1")
-        failures += check("... on a spare VT",
-                          str(lock_vt > VT).encode(), b"True")
-        failures += check("Ctrl+Alt+F1, VT_ACTIVATE, Ctrl+C: still locked",
+        failures += check("... on a VT from the top (>= 13)",
+                          str(lock_vt >= 13 and lock_vt != VT).encode(), b"True")
+        failures += check("locked: the typing socket refuses",
+                          state["typing"].encode(),
+                          b"denied: the console is locked")
+        failures += check("locked: Win+Shift+S does nothing",
+                          str(state["lid_after"] == state["lid_before"]).encode(),
+                          b"True")
+        failures += check("Ctrl+Alt+F1, VT_ACTIVATE, Ctrl+C/Z/\\: still locked",
                           str(state["after_escapes"]).encode(),
                           str((lock_vt, True)).encode())
-        failures += check("daemon restart: still locked",
-                          str(state["after_restart"]).encode(),
-                          str((lock_vt, True)).encode())
+        failures += check("daemon restart: still locked, and adopted",
+                          f"{state['after_restart']} "
+                          f"{state['typing_after_restart']}".encode(),
+                          f"{(lock_vt, True)} denied: the console is locked"
+                          .encode())
+        failures += check("unrecorded lock: found running, adopted",
+                          f"{state['after_unrecorded']} "
+                          f"{state['typing_unrecorded']}".encode(),
+                          f"{(lock_vt, True)} denied: the console is locked"
+                          .encode())
         failures += check("wrong password: still locked",
                           str(state["after_wrong"]).encode(),
                           str((lock_vt, True)).encode())
         failures += check("right password: unlocked, back on the VT",
                           str(state["after_right"]).encode(),
                           str((VT, False)).encode())
+        failures += check("the lock VT is freed",
+                          str(state["lock_vt_freed"]).encode(), b"True")
         failures += check("VT switching works again",
                           str(state["switch_after"]).encode(), b"1")
-        failures += check("the spare VT is freed",
-                          str(state["spare_freed"]).encode(), b"True")
     finally:
-        for pid in vlock_pids(pwd.getpwnam(LOCK_USER).pw_uid):
+        # A lock killed by root leaves switching locked (fail closed): undo
+        # that here, or the machine stays on the lock VT.
+        leftover = lock_pids(LOCK_USER)
+        for pid in leftover:
             os.kill(pid, 9)
+        if leftover:
+            time.sleep(0.3)
+            with open("/dev/tty0", "rb") as tty0:
+                fcntl.ioctl(tty0, 0x560C, 0)        # VT_UNLOCKSWITCH
+            subprocess.run(["chvt", str(VT)])
         subprocess.run(["userdel", LOCK_USER])
     return failures
 
@@ -517,8 +569,11 @@ def typing_test():
 
 
 def main():
+    # One VT test at a time (ttysecurelock's test takes the same lock).
+    lockfile = open("/tmp/vt12-test.lock", "w")
+    fcntl.flock(lockfile, fcntl.LOCK_EX)
     # A console lock blocks every VT switch: the test would hang on chvt.
-    if os.path.exists("/run/tty-i3-keys/lock.json"):
+    if os.path.exists("/run/tty-i3-keys/lock.json") or lock_pids():
         sys.exit("the console is locked (Win+Escape): unlock it first")
     others = subprocess.run(["pgrep", "-f", "tests/vt-test"],
                             capture_output=True, text=True).stdout.split()
