@@ -27,9 +27,11 @@ is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
                          nobody, touchpads and mice are off, the touchscreen
                          and the volume buttons keep working. Only both
                          volume buttons together unlock;
-  Menu                   toggle the VT owner's nerd-dictation (for laptops
-                         without a middle mouse button; console-mouse's
-                         middle click does the same), its reply in the bar.
+  dictation key          only where /etc/tty-i3-keys.toml sets
+                         dictation_key (yoga3: the Menu key, 127): toggle the
+                         VT owner's nerd-dictation, its reply in the bar -
+                         for a laptop without a middle mouse button
+                         (elsewhere console-mouse's middle click does it).
 
 It also types text into the console for its owner on request, through a
 socket (see TypeService): nerd-dictation's dictated text.
@@ -73,6 +75,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import traceback
 import unicodedata
 
@@ -85,7 +88,7 @@ KEY_S = 31
 KEY_ESC = 1
 KEY_O = 24
 KEY_K = 37
-KEY_COMPOSE = 127               # the Menu key
+CONFIG = "/etc/tty-i3-keys.toml"
 KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 113, 114, 115
 KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
 # The commands bound to these keys in ~/.config/i3/config.
@@ -1714,8 +1717,8 @@ def handle(held, device, code, value, media_keys, last_media, bar, lock, kbd,
     if code in media_keys:
         act(code)
         return
-    if code == KEY_COMPOSE:
-        # The Menu key alone (repeats ignored): the dictation toggle.
+    if code == DICTATION_KEY:
+        # The configured key alone (repeats ignored): the dictation toggle.
         if value == 1 and not held & (WIN | CTRL_ALT):
             tty = foreground_text_vt()
             if tty:
@@ -1859,7 +1862,34 @@ def run(keymap, media_keys, bar, lock, typer, kbd, dictation):
                     traceback.print_exc()
 
 
+def load_config(path):
+    """Per-machine settings. Only one so far:
+
+      dictation_key = 127   # evdev keycode that toggles the console owner's
+                            # nerd-dictation; for a machine without a middle
+                            # mouse button (yoga3: the Menu key, 127).
+                            # Absent: no dictation key.
+    """
+    global DICTATION_KEY
+    try:
+        with open(path, "rb") as f:
+            config = tomllib.load(f)
+    except FileNotFoundError:
+        return
+    key = config.get("dictation_key")
+    if key is not None:
+        if not isinstance(key, int) or not 0 < key < 768:
+            sys.exit(f"{path}: dictation_key must be an evdev keycode, got {key!r}")
+        DICTATION_KEY = key
+        print(f"dictation key: keycode {key}", flush=True)
+
+
+DICTATION_KEY = None
+
+
 def main():
+    load_config(sys.argv[sys.argv.index("--config") + 1]
+                if "--config" in sys.argv else CONFIG)
     media_keys = set(VOLUME) | set(BRIGHTNESS)
     reserved = console_toggle_keys() & media_keys
     if reserved:
@@ -1868,10 +1898,9 @@ def main():
     media_keys -= reserved
     entries = {code: K_SHIFTL for code in WIN}
     entries.update({code: K_HOLE for code in media_keys})
-    # The Menu key toggles dictation: it must not also be a console key
-    # (ruwin_cplk maps it to nothing; another keymap may not).
-    if KEY_COMPOSE not in console_toggle_keys():
-        entries[KEY_COMPOSE] = K_HOLE
+    # The dictation key must not also be a console key.
+    if DICTATION_KEY is not None and DICTATION_KEY not in console_toggle_keys():
+        entries[DICTATION_KEY] = K_HOLE
     keymap = Keymap(entries)
     restore_rotation()
     bar = Bar()

@@ -14,7 +14,7 @@ foreground VT is in text mode (not X), acts for the user who owns that VT:
 | `Win+Escape` | lock all consoles with [ttysecurelock](https://github.com/dmikushin/ttysecurelock), the counterpart of i3's `xsecurelock`: asks for the VT owner's password |
 | `Win+O` | rotate the console a quarter turn clockwise (fbcon `rotate_all`), for convertible laptops; kept across reboots in `/var/lib/tty-i3-keys/rotation` |
 | `Win+K`, or both volume buttons together | lock the keyboard (book-reader mode on a convertible folded into a tablet); only both volume buttons together unlock - see below |
-| `Menu` | toggle the console owner's [nerd-dictation](../nerd-dictation) (for laptops without a middle mouse button; console-mouse's middle click does the same); its reply shows in the bar, and the key types nothing on the console |
+| dictation key | only on a machine whose `/etc/tty-i3-keys.toml` sets `dictation_key` (an evdev keycode; yoga3: `dictation_key = 127`, the Menu key, as it has no middle mouse button): toggles the console owner's [nerd-dictation](../nerd-dictation), its reply shows in the bar, and the key types nothing on the console. Without the setting no key is taken |
 
 Feedback appears in the same bar for 2.5 seconds, with the message at the
 left and the status at the right: the lid state, the volume and brightness

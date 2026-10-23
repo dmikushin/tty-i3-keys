@@ -49,6 +49,11 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DAEMON = os.path.join(HERE, "..", "tty-i3-keys")
+# The daemons started by the test take the dictation key from this file,
+# as yoga3 does from /etc/tty-i3-keys.toml.
+TEST_CONFIG = "/tmp/tty-i3-keys-test.toml"
+with open(TEST_CONFIG, "w") as f:
+    f.write(f"dictation_key = 127\n")
 VT = 12
 TTY = f"/dev/tty{VT}"
 USER = pwd.getpwnam(os.environ["SUDO_USER"])
@@ -228,15 +233,15 @@ def owned_entry_test(slot, value, running, label):
     kb_entry(fd, *slot, value)
     seen = []
     try:
-        d = subprocess.Popen([sys.executable, DAEMON])
+        d = subprocess.Popen([sys.executable, DAEMON, "--config", TEST_CONFIG])
         time.sleep(1.2)
         seen.append(kb_entry(fd, *slot))        # the daemon's value while running
         d.terminate(); d.wait()
         seen.append(kb_entry(fd, *slot))        # back after a clean stop
-        d = subprocess.Popen([sys.executable, DAEMON])
+        d = subprocess.Popen([sys.executable, DAEMON, "--config", TEST_CONFIG])
         time.sleep(1.2)
         d.kill(); d.wait()
-        d = subprocess.Popen([sys.executable, DAEMON])
+        d = subprocess.Popen([sys.executable, DAEMON, "--config", TEST_CONFIG])
         time.sleep(1.2)
         d.terminate(); d.wait()
         seen.append(kb_entry(fd, *slot))        # back after SIGKILL + restart
@@ -766,20 +771,20 @@ def main():
     grabbed = grab_keyboards()
     kb = uinput()
     time.sleep(0.3)
-    daemon = subprocess.Popen([sys.executable, DAEMON])
+    daemon = subprocess.Popen([sys.executable, DAEMON, "--config", TEST_CONFIG])
     time.sleep(0.8)
 
     def restart_daemon():
         nonlocal daemon
         daemon.terminate()
         daemon.wait()
-        daemon = subprocess.Popen([sys.executable, DAEMON])
+        daemon = subprocess.Popen([sys.executable, DAEMON, "--config", TEST_CONFIG])
 
     def crash_restart():
         nonlocal daemon
         daemon.kill()
         daemon.wait()
-        daemon = subprocess.Popen([sys.executable, DAEMON])
+        daemon = subprocess.Popen([sys.executable, DAEMON, "--config", TEST_CONFIG])
     tmux = ["tmux", "-L", "tty-i3-keys-test"]
     try:
         # 1. Typing on a root-owned VT (no user: volume does nothing there).
@@ -819,8 +824,11 @@ def main():
         elif want("brightness"):
             run_reader(1.5, bright)
             failures += check("brightness down then up",
-                              str(bright.down < bl_before and bright.up > bright.down
-                                  ).encode(), b"True")
+                              f"{bright.down < bl_before and bright.up > bright.down}"
+                              f" (before {bl_before}, down {bright.down}, up {bright.up})"
+                              .encode(),
+                              f"True (before {bl_before}, down {bright.down}, up {bright.up})"
+                              .encode())
 
         # The Win-held status bar, on a VT of the user.
         def bar(redraw):
