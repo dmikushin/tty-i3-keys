@@ -1416,7 +1416,10 @@ def running_lock():
             with open(comm) as f:
                 if f.read().strip() != "ttysecurelock":
                     continue
-            if os.readlink(f"/proc/{pid}/exe") != TTYSECURELOCK:
+            # " (deleted)": a lock still running from a binary since
+            # reinstalled is a lock all the same.
+            exe = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
+            if exe != TTYSECURELOCK:
                 continue
             with open(f"/proc/{pid}/status") as f:
                 caps = [int(line.split()[1], 16) for line in f
