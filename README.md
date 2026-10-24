@@ -61,7 +61,7 @@ How it works:
 ## The lock
 
 `Win+Escape` starts [ttysecurelock](https://github.com/dmikushin/ttysecurelock)
-— xsecurelock's PAM path on the text console — for the owner of the VT in
+— xsecurelock itself on the text console — for the owner of the VT in
 front, so the password asked is that user's, checked by xsecurelock's own
 `authproto_pam`, as with `xsecurelock` under X. It must be installed
 (`/usr/local/bin/ttysecurelock`, `make install` in its repository).

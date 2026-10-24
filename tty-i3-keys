@@ -16,7 +16,7 @@ is in text mode (KD_TEXT, i.e. not X), acts for the user who owns the VT:
   brightness up/down     brightnessctl, as in the i3 config (never to 0);
   Win held               the i3 bar (i3's "mode hide" bar, "modifier Mod4");
   Win+Escape             lock all consoles, like i3's xsecurelock:
-                         ttysecurelock (xsecurelock's PAM path on the
+                         ttysecurelock (xsecurelock on the text
                          console), asking for the VT owner's password (see
                          Lock);
   Win+O                  rotate the console 90 degrees clockwise (fbcon
@@ -1403,16 +1403,25 @@ def process_start(pid):
         return int(f.read().rsplit(")", 1)[1].split()[19])
 
 
+CAP_SYS_TTY_CONFIG = 26
+
+
 def running_lock():
-    """A running ttysecurelock (root's: no user can start one that locks),
-    as {"pid", "start"}, or None."""
+    """A running ttysecurelock, as {"pid", "start"}, or None. Started by
+    root, it runs as the locked user but keeps CAP_SYS_TTY_CONFIG, which no
+    process a user starts can have: that tells a real lock from a namesake."""
     for comm in glob.glob("/proc/[0-9]*/comm"):
         pid = int(comm.split("/")[2])
         try:
             with open(comm) as f:
                 if f.read().strip() != "ttysecurelock":
                     continue
-            if os.stat(f"/proc/{pid}").st_uid != 0:
+            if os.readlink(f"/proc/{pid}/exe") != TTYSECURELOCK:
+                continue
+            with open(f"/proc/{pid}/status") as f:
+                caps = [int(line.split()[1], 16) for line in f
+                        if line.startswith("CapPrm:")]
+            if not caps or not caps[0] >> CAP_SYS_TTY_CONFIG & 1:
                 continue
             return {"pid": pid, "start": process_start(pid)}
         except OSError:
@@ -1422,16 +1431,17 @@ def running_lock():
 
 class Lock:
     """The counterpart of i3's xsecurelock on the text console: ttysecurelock
-    (github.com/dmikushin/ttysecurelock), xsecurelock's PAM path without X.
+    (github.com/dmikushin/ttysecurelock), xsecurelock running without X.
 
-    It runs as root and locks for the owner of the VT that was in front,
-    passed as --user: it takes a free VT from the top (above logind's autovt
-    range), puts it in VT_PROCESS mode and refuses every switch away, sets
-    VT_LOCKSWITCH, reads the keyboard raw (Ctrl+C, Ctrl+Z, Ctrl+\\ do
-    nothing) and checks each password with xsecurelock's authproto_pam run as
-    that user. On the right password it switches back and frees its VT.
-    Running as root, the user's own processes cannot signal it; if root kills
-    it, switching stays locked (fail closed).
+    It is xsecurelock itself on a console platform layer. Started as root,
+    it locks for the owner of the VT that was in front, passed as --user: it
+    takes a free VT from the top (above logind's autovt range), puts it in
+    VT_PROCESS mode and refuses every switch away, sets VT_LOCKSWITCH, reads
+    the keyboard raw (Ctrl+C, Ctrl+Z, Ctrl+\\ do nothing), then runs as that
+    user with CAP_SYS_TTY_CONFIG only, showing xsecurelock's prompt and
+    checking passwords with its authproto_pam. On the right password it
+    switches back and frees its VT. If it is killed, switching stays locked
+    (fail closed).
 
     It is started in a transient scope of its own (systemd-run --scope), so
     it is outside this daemon's cgroup and session: stopping or restarting

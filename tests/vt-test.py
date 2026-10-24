@@ -500,10 +500,14 @@ def lock_test(kb, restart_daemon):
             time.sleep(1.5)
             state["after_unrecorded"] = locked()
             state["typing_unrecorded"] = type_request(uid, "intruder")
-            chord(kb, KEY_ESC)              # Esc clears the password input
+            # xsecurelock: the keys above woke the prompt (the key that wakes
+            # it is not typed; control characters are ignored), and a failed
+            # attempt closes it again, so the next key wakes it once more.
             type_text(kb, "1111")
             time.sleep(4.0)                 # pam_unix's delay after a failure
             state["after_wrong"] = locked()
+            chord(kb, KEY_LEFTSHIFT)
+            time.sleep(1.5)
             type_text(kb, LOCK_PASSWORD)
             for _ in range(80):
                 time.sleep(0.1)
