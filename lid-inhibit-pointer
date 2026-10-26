@@ -1,0 +1,66 @@
+#!/usr/bin/python3
+"""Inhibit the internal touchpad and TrackPoint while the laptop lid is closed.
+
+A closed lid presses on the TrackPoint buttons / touchpad and produces phantom
+clicks and psmouse resync storms. Setting /sys/class/input/inputN/inhibited=1
+stops event delivery to every reader (libinput, evdev daemons) in the kernel.
+
+  lid-inhibit-pointer apply   - sync inhibit state with current lid state once
+  lid-inhibit-pointer watch   - apply, then follow lid switch events forever
+"""
+import glob
+import os
+import struct
+import sys
+
+LID_STATE = glob.glob("/proc/acpi/button/lid/*/state")[0]
+# Internal pointing devices: the RMI4 touchpad and the PS/2 TrackPoint
+# passed through it (rmi4-00.fn03/serio2).
+POINTER_MARK = "/rmi4-"
+
+EV_SW, SW_LID = 0x05, 0x00
+EVENT = struct.Struct("llHHi")
+
+
+def lid_closed():
+    with open(LID_STATE) as f:
+        return f.read().split()[-1] == "closed"
+
+
+def set_inhibited(closed):
+    value = "1" if closed else "0"
+    for dev in glob.glob("/sys/class/input/input*"):
+        if POINTER_MARK not in os.path.realpath(dev):
+            continue
+        with open(os.path.join(dev, "inhibited"), "w") as f:
+            f.write(value)
+        with open(os.path.join(dev, "name")) as f:
+            name = f.read().strip()
+        print(f"{name}: inhibited={value}", flush=True)
+
+
+def lid_event_device():
+    for dev in glob.glob("/sys/class/input/input*"):
+        with open(os.path.join(dev, "name")) as f:
+            if f.read().strip() == "Lid Switch":
+                return "/dev/input/" + os.path.basename(glob.glob(dev + "/event*")[0])
+    sys.exit("Lid Switch input device not found")
+
+
+def watch():
+    set_inhibited(lid_closed())
+    with open(lid_event_device(), "rb") as f:
+        while True:
+            _, _, type_, code, value = EVENT.unpack(f.read(EVENT.size))
+            if type_ == EV_SW and code == SW_LID:
+                set_inhibited(value == 1)
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "apply":
+        set_inhibited(lid_closed())
+    elif mode == "watch":
+        watch()
+    else:
+        sys.exit(__doc__)

@@ -1,0 +1,9 @@
+[Unit]
+Description=Inhibit internal touchpad and TrackPoint while the lid is closed
+
+[Service]
+ExecStart=/usr/local/bin/lid-inhibit-pointer watch
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,7 @@
 PREFIX ?= /usr/local
 UNITDIR ?= /etc/systemd/system
 POLKITDIR ?= /etc/polkit-1/rules.d
+UDEVDIR ?= /etc/udev/rules.d
 
 install:
 	install -Dm755 tty-i3-keys $(DESTDIR)$(PREFIX)/bin/tty-i3-keys
@@ -23,3 +24,22 @@ test:
 	python3 tests/vt-test.py
 
 .PHONY: install uninstall test
+
+# Laptops whose touchpad sits on Synaptics RMI4 (ThinkPads; the TrackPoint is
+# passed through it): switch both off while the lid is closed, where the lid
+# presses on them. Hardware-specific, so a separate target.
+install-lid-pointer:
+	install -Dm755 lid-inhibit-pointer $(DESTDIR)$(PREFIX)/bin/lid-inhibit-pointer
+	install -Dm644 lid-inhibit-pointer.service $(DESTDIR)$(UNITDIR)/lid-inhibit-pointer.service
+	install -Dm644 90-lid-inhibit-pointer.rules $(DESTDIR)$(UDEVDIR)/90-lid-inhibit-pointer.rules
+	udevadm control --reload
+	systemctl daemon-reload
+	systemctl enable lid-inhibit-pointer.service
+	systemctl restart lid-inhibit-pointer.service
+
+uninstall-lid-pointer:
+	systemctl disable --now lid-inhibit-pointer.service
+	rm -f $(DESTDIR)$(PREFIX)/bin/lid-inhibit-pointer $(DESTDIR)$(UNITDIR)/lid-inhibit-pointer.service \
+		$(DESTDIR)$(UDEVDIR)/90-lid-inhibit-pointer.rules
+	udevadm control --reload
+	systemctl daemon-reload

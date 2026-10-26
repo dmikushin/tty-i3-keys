@@ -168,3 +168,14 @@ recorded in `/var/lib/tty-i3-keys/inhibited-pointers` before they are
 inhibited, put back on exit, and put back when the daemon starts after a
 crash. With the console lock (`Win+Escape`) on, the chord still unlocks the
 keyboard so the password can be typed; the volume buttons do nothing then.
+
+## Pointer off while the lid is closed (ThinkPads)
+
+`sudo make install-lid-pointer` installs `lid-inhibit-pointer`: while the lid
+is closed it sets `inhibited=1` on the input devices behind Synaptics RMI4 (the
+touchpad and the TrackPoint passed through it), because a closed lid presses
+on them and produces phantom clicks and psmouse resync storms. A udev rule
+re-applies it when psmouse re-creates the TrackPoint. Check that the laptop's
+touchpad is on RMI4 first: `realpath /sys/class/input/input*` shows `rmi4-`
+in the touchpad's path. Note: opening the lid enables the devices even while
+the keyboard lock (Win+K) holds them off.

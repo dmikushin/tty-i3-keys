@@ -1,0 +1,2 @@
+# psmouse resyncs re-create the TrackPoint input device; re-apply lid inhibit to it.
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="input*", DEVPATH=="*/rmi4-*", RUN+="/usr/local/bin/lid-inhibit-pointer apply"
