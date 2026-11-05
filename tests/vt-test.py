@@ -67,12 +67,13 @@ KEY_ESC, KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1 = 1, 28, 46, 56, 59
 KEY_K = 37
 KEY_COMPOSE = 127               # the Menu key: the dictation toggle
 KEY_Z, KEY_BACKSLASH = 44, 43
+KEY_SYSRQ = 99                  # Print Screen
 DIGIT_KEYS = {str(d % 10): 1 + d for d in range(1, 11)}    # KEY_1 = 2 .. KEY_0 = 11
 KEYS = (KEY_1, KEY_2, KEY_3, KEY_A, KEY_Q, KEY_S, KEY_LEFTCTRL,
         KEY_LEFTSHIFT, KEY_CAPSLOCK, KEY_LEFTMETA, KEY_MUTE, KEY_VOLUMEDOWN,
         KEY_VOLUMEUP, KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP, KEY_ESC,
         KEY_ENTER, KEY_C, KEY_LEFTALT, KEY_F1, KEY_K, KEY_Z, KEY_BACKSLASH,
-        KEY_COMPOSE, *DIGIT_KEYS.values())
+        KEY_COMPOSE, KEY_SYSRQ, *DIGIT_KEYS.values())
 LOCK_USER = "ttyi3keyslocktest"
 LOCK_PASSWORD = "73914286"   # digits: the same in the Latin and Cyrillic layouts
 UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
@@ -813,6 +814,37 @@ def main():
             expected += b"2"
             failures += check("typing; Win+1 and media keys type nothing", got,
                               expected)
+
+        if want("screenshot"):
+            directory = os.path.join(USER.pw_dir, "Pictures/Screenshots")
+            listed = lambda: (set(os.listdir(directory))
+                              if os.path.isdir(directory) else set())
+            before = listed()
+
+            def shot():
+                # The console's owner, as logind leaves a real login: the
+                # screenshot is saved into that user's Pictures/Screenshots.
+                os.chown(TTY, USER.pw_uid, USER.pw_gid)
+                chord(kb, KEY_SYSRQ)
+                time.sleep(1.0)
+
+            got = run_reader(2.5, shot)
+            new = sorted(listed() - before)
+            path = os.path.join(directory, new[-1]) if new else ""
+            header = open(path, "rb").read(33) if path else b""
+            size = (int(x) for x in open(
+                "/sys/class/graphics/fb0/virtual_size").read().split(","))
+            failures += check("Print Screen saves a PNG at the screen size",
+                              ("%s %s" % (header[:8] == b"\x89PNG\r\n\x1a\n",
+                                          header[16:24] == struct.pack(">II", *size))
+                               ).encode(),
+                              b"True True")
+            failures += check("Print Screen saves it for the console owner",
+                              (str(os.stat(path).st_uid == USER.pw_uid).encode()
+                               if path else b"False"), b"True")
+            failures += check("Print Screen types nothing", got, b"")
+            if path:
+                os.unlink(path)
 
         # 2. Brightness (acts on any VT).
         def bright():
